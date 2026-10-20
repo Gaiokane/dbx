@@ -3,7 +3,7 @@
 PNPM ?= pnpm
 TAURI_DEV_PORT ?= 1420
 
-.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion
+.PHONY: help install docs-install check-tauri-dev-port check-node-modules dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion
 
 export DB
 export DB_VERSION
@@ -40,6 +40,7 @@ help:
 	@printf '%s\n' 'Checks:'
 	@printf '  %-23s %s\n' 'make check' 'Run project checks'
 	@printf '  %-23s %s\n' 'make test' 'Run project tests'
+	@printf '  %-23s %s\n' 'make check-node-modules' 'Verify the pnpm link layout of node_modules'
 	@printf '  %-23s %s\n' 'make cargo-check-fast' 'Run Rust check without default features'
 	@printf '  %-23s %s\n' 'make cargo-test-fast' 'Run Rust tests without default features'
 	@printf '%s\n' ''
@@ -76,24 +77,30 @@ check-tauri-dev-port:
 	fi
 endif
 
-dev: node_modules/.modules.yaml check-tauri-dev-port
+# pnpm's isolated layout links packages instead of copying them. A tree that was
+# materialised as plain directories breaks module resolution and surfaces as
+# unrelated errors, for example "Cannot find native binding" for the Tauri CLI.
+check-node-modules:
+	node scripts/check-node-modules-links.mjs
+
+dev: node_modules/.modules.yaml check-node-modules check-tauri-dev-port
 	$(PNPM) dev:tauri
 
-dev-fast: node_modules/.modules.yaml check-tauri-dev-port
+dev-fast: node_modules/.modules.yaml check-node-modules check-tauri-dev-port
 	# os-keyring must stay in sync with src-tauri defaults: without it the keychain
 	# key is unreadable and the secret-store migration wizard reappears on every launch.
 	RUST_MIN_STACK=16777216 $(PNPM) dev:tauri -- --no-default-features --features duckdb-sidecar,dynamodb,sqlite-bundled,os-keyring,sqlserver-native-attention
 
-dev-web: node_modules/.modules.yaml
+dev-web: node_modules/.modules.yaml check-node-modules
 	$(PNPM) dev:web
 
-dev-backend: node_modules/.modules.yaml
+dev-backend: node_modules/.modules.yaml check-node-modules
 	$(PNPM) dev:backend
 
-build: node_modules/.modules.yaml
+build: node_modules/.modules.yaml check-node-modules
 	$(PNPM) build:checked
 
-package: node_modules/.modules.yaml
+package: node_modules/.modules.yaml check-node-modules
 	$(PNPM) tauri build
 
 clean:
@@ -105,10 +112,10 @@ docs: docs/node_modules/.modules.yaml
 docs-build: docs/node_modules/.modules.yaml
 	cd docs && ./node_modules/.bin/next build && node scripts/generate-sitemap.mjs
 
-check: node_modules/.modules.yaml
+check: node_modules/.modules.yaml check-node-modules
 	$(PNPM) check
 
-test: node_modules/.modules.yaml
+test: node_modules/.modules.yaml check-node-modules
 	$(PNPM) test
 
 cargo-check-fast:

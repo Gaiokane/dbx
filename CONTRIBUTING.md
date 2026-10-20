@@ -44,6 +44,21 @@ make docs              # preview the documentation site
 make cargo-check-fast  # fast Rust checks
 ```
 
+### node_modules Link Layout
+
+pnpm's isolated layout links packages instead of copying them. A `node_modules` tree that was materialised as plain directories breaks module resolution without any warning, and the errors that surface point at unrelated packages — for example `Cannot find native binding` for the Tauri CLI, or `No "exports" main defined` for ESM-only packages.
+
+`make dev`, `make dev-fast`, `pnpm dev` and `pnpm dev:tauri` verify the layout before starting and report the exact paths to repair. To repair it, delete the whole tree and reinstall: pnpm only rebuilds the top-level links and leaves already existing deep directories alone, so an incremental `pnpm install` cannot fix it.
+
+```powershell
+Remove-Item -Recurse -Force node_modules
+pnpm install --frozen-lockfile
+```
+
+```bash
+node --test scripts/check-node-modules-links.test.mjs
+```
+
 ### macOS Development Signing
 
 Use `make dev`, `make dev-fast`, or `pnpm dev:tauri`. These entry points sign each rebuilt debug executable with a stable, local-only development identity before launching it. The first launch may still ask you to select **Always Allow** for DBX's existing Keychain item; subsequent rebuilds keep the same code identity. Direct `pnpm tauri dev` bypasses this setup.

@@ -42,6 +42,21 @@ make docs              # 本地预览文档站
 make cargo-check-fast  # 快速 Rust 检查
 ```
 
+### node_modules 链接布局
+
+pnpm 的 isolated 布局是**链接**包，而不是复制包。如果 `node_modules` 被物化成了实体目录，模块解析会在没有任何提示的情况下失效，而报出来的错往往指向毫不相干的包——例如 Tauri CLI 的 `Cannot find native binding`，或者纯 ESM 包的 `No "exports" main defined`。
+
+`make dev`、`make dev-fast`、`pnpm dev` 和 `pnpm dev:tauri` 会在启动前校验该布局，并直接报出需要修复的具体路径。修复方式是整棵删除后重装：pnpm 只会重建顶层的链接，已经存在的深层目录不会被修复，所以增量执行 `pnpm install` 无法解决。
+
+```powershell
+Remove-Item -Recurse -Force node_modules
+pnpm install --frozen-lockfile
+```
+
+```bash
+node --test scripts/check-node-modules-links.test.mjs
+```
+
 ### macOS 开发签名
 
 请使用 `make dev`、`make dev-fast` 或 `pnpm dev:tauri`。这些入口会在每次重新编译后、启动前，用固定的本地开发身份签名。首次启动仍可能需要对 DBX 原有钥匙串条目选择一次“始终允许”，之后重编译保持相同代码身份。直接执行 `pnpm tauri dev` 会绕过此流程。
