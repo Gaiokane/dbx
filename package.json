@@ -32,6 +32,8 @@
     "build:docs-export": "vite build --config apps/desktop/vite.docs-export.config.ts",
     "build:checked": "pnpm typecheck && pnpm build",
     "check": "node scripts/run-check.mjs",
+    "clean:incremental": "node scripts/clean-incremental.mjs",
+    "test:clean-incremental": "node --test scripts/clean-incremental.test.mjs",
     "db:env": "node scripts/database-env.mjs",
     "test:db-env": "node --test scripts/database-env.test.mjs",
     "test:architecture": "node --test scripts/core-architecture.test.mjs",
