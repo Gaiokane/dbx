@@ -1479,7 +1479,19 @@ fn write_test_agent_jar(path: &std::path::Path) {
 fn test_agent_jar_bytes() -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // The ZIP header carries the current time by default, so two archives built
+    // seconds apart differ even though their content is identical. The offline
+    // import test compares a packaged jar with a freshly built one, so the
+    // timestamp has to be pinned for the comparison to be about content.
+    //
+    // 1980-02-01 00:00:00 is the fixed timestamp that reproducible builds use
+    // for ZIP entries (Gradle raises anything earlier to it), and it stays
+    // clear of 1980-01-01 00:00:00, which the JDK reads as its "before 1980"
+    // marker and answers with extra timezone metadata.
+    let timestamp = zip::DateTime::from_date_and_time(1980, 2, 1, 0, 0, 0).expect("1980-02-01 fits the ZIP range");
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .last_modified_time(timestamp);
     // The production validator rejects corrupt driver artifacts by requiring a real JAR manifest.
     zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
     std::io::Write::write_all(&mut zip, b"Manifest-Version: 1.0\nMain-Class: com.dbx.agent.TestAgent\n\n").unwrap();
