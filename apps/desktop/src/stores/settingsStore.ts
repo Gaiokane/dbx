@@ -3206,6 +3206,11 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.autoSelectActiveSidebarNode !== undefined) editorSettings.value.autoSelectActiveSidebarNode = partial.autoSelectActiveSidebarNode;
     if (partial.sidebarPinDefaultDatabase !== undefined) editorSettings.value.sidebarPinDefaultDatabase = partial.sidebarPinDefaultDatabase === true;
     if (partial.sidebarBrowseObjectsOnDatabaseActivation !== undefined) editorSettings.value.sidebarBrowseObjectsOnDatabaseActivation = partial.sidebarBrowseObjectsOnDatabaseActivation === true;
+    // #13549: this key reached the interface, the defaults, the normalize whitelist and the
+    // settings dialog draft, but never this patch applier. Without the branch below the
+    // toggle was dropped on every apply, so the value never reached the store or disk and
+    // the dialog stayed permanently dirty.
+    if (partial.sidebarExpandTreeOnConnect !== undefined) editorSettings.value.sidebarExpandTreeOnConnect = partial.sidebarExpandTreeOnConnect === true;
     if (partial.openQueryOnConnectionOpen !== undefined) editorSettings.value.openQueryOnConnectionOpen = partial.openQueryOnConnectionOpen === true;
     if (partial.openTabsRestoreMode !== undefined) editorSettings.value.openTabsRestoreMode = normalizeOpenTabsRestoreMode(partial.openTabsRestoreMode);
     if (partial.autoReloadRestoredDataTabsOnOpen !== undefined) editorSettings.value.autoReloadRestoredDataTabsOnOpen = partial.autoReloadRestoredDataTabsOnOpen === true;
