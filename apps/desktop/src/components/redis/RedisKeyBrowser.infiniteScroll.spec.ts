@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   scrollerRefresh: vi.fn(),
   ensureConnected: vi.fn(),
   redisScanKeysBatch: vi.fn(),
+  redisKeyMetadataBatch: vi.fn(),
   redisScanValues: vi.fn(),
   redisGetValue: vi.fn(),
   redisSetString: vi.fn(),
@@ -46,6 +47,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/backend/api", () => ({
   redisScanKeysBatch: mocks.redisScanKeysBatch,
+  redisKeyMetadataBatch: mocks.redisKeyMetadataBatch,
   redisScanValues: mocks.redisScanValues,
   redisGetValue: mocks.redisGetValue,
   redisSetString: mocks.redisSetString,
@@ -375,6 +377,7 @@ function resetApiMocks() {
   mocks.queryResultMaxRowsEnabled = true;
   mocks.queryResultMaxRows = 5000;
   mocks.redisScanKeysBatch.mockResolvedValue({ cursor: 0, keys: [], total_keys: 0 });
+  mocks.redisKeyMetadataBatch.mockReset().mockResolvedValue([]);
   mocks.redisScanValues.mockReset().mockResolvedValue({ cursor: 0, keys: [], total_keys: 0 });
 }
 
@@ -1249,5 +1252,88 @@ describe("RedisKeyBrowser group subtree fill on expand (issue #7162)", () => {
 
     expect(scanCallsWithPattern("grp:*")).toBe(0);
     expect(host.textContent).toContain("b");
+  });
+});
+
+// The footer is a permanent action bar: "Load more" only fills the rest of
+// the keyspace (unchanged semantics), while "Fetch all" became a full rescan
+// that can be repeated. The bar used to disappear as soon as the scan cursor
+// reached the end, which left the user without any way to refresh the list.
+describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
+  it("keeps the footer visible after the keyspace was scanned completely", async () => {
+    mocks.infiniteScroll = false;
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfo("a")], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+
+    const loadMore = host.querySelector<HTMLButtonElement>("[data-redis-load-more]");
+    const fetchAll = host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]");
+    expect(loadMore, "load more button").not.toBeNull();
+    expect(fetchAll, "fetch all button").not.toBeNull();
+    // Nothing left to fill: the button stays visible but disabled.
+    expect(loadMore!.disabled).toBe(true);
+    expect(fetchAll!.disabled).toBe(false);
+  });
+
+  it("rescans the whole database from cursor 0 and offers a refetch afterwards", async () => {
+    mocks.infiniteScroll = false;
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfo("a")], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+
+    const fetchAll = host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!;
+    expect(fetchAll.textContent).toContain("redis.fetchAllKeys");
+
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfo("a"), keyInfo("b")], total_keys: 2 });
+    fetchAll.click();
+    await settleThoroughly();
+
+    // The sweep restarts at cursor 0 instead of continuing an exhausted one.
+    const scanCalls = mocks.redisScanKeysBatch.mock.calls;
+    expect(scanCalls[scanCalls.length - 1]?.[2]).toBe(0);
+    // A finished sweep turns the same button into the repeat action.
+    expect(host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.textContent).toContain("redis.refetchAllKeys");
+  });
+
+  it("keeps the load-more action incremental instead of rescanning", async () => {
+    mocks.infiniteScroll = false;
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
+      if (cursor === 0) return Promise.resolve({ cursor: 42, keys: [keyInfo("a")], total_keys: 10 });
+      return Promise.resolve({ cursor: 0, keys: [keyInfo("b")], total_keys: 10 });
+    });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+
+    const loadMore = host.querySelector<HTMLButtonElement>("[data-redis-load-more]")!;
+    expect(loadMore.disabled).toBe(false);
+    loadMore.click();
+    await settleThoroughly();
+
+    // The page continues from the previous cursor; it does not start over.
+    const scanCalls = mocks.redisScanKeysBatch.mock.calls;
+    expect(scanCalls[scanCalls.length - 1]?.[2]).toBe(42);
+    expect(host.textContent).toContain("b");
+  });
+
+  it("fills the missing type and expiry metadata of the listed rows", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "string", ttl: 3600 }]);
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    expect(mocks.redisKeyMetadataBatch).toHaveBeenCalled();
+    const metadataCalls = mocks.redisKeyMetadataBatch.mock.calls;
+    expect(metadataCalls[metadataCalls.length - 1]?.[2]).toEqual([btoa("a")]);
+    // The type badge of the row is filled in by the backfill.
+    expect(host.textContent).toContain("string");
   });
 });

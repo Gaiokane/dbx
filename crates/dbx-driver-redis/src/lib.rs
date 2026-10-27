@@ -95,6 +95,20 @@ pub struct RedisScanResult {
     pub total_keys: u64,
 }
 
+/// Per-key metadata (type + TTL) resolved for an explicit list of keys.
+///
+/// The "fetch all" path scans key names without TYPE/TTL so a million-key
+/// database is not hit with two extra commands per key. When the UI needs
+/// those badges afterwards it asks for exactly the keys it shows, so the cost
+/// stays proportional to the visible rows instead of the keyspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisKeyMetadata {
+    pub key_raw: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_type: String,
+    pub ttl: i64,
+}
+
 /// The expiration shapes the Key Browser may apply to a batch of selected keys.
 ///
 /// The variants mirror [`set_ttl`] and [`set_expire_at`] exactly, so a batch edit
@@ -3151,6 +3165,44 @@ where
     C: ConnectionLike + Send + Sync + Unpin,
 {
     scan_keys_batch_inner(con, cursor, pattern, count, max_iterations, include_types, true).await
+}
+
+/// Reads TYPE and TTL for a batch of named keys in one round trip.
+///
+/// This is the metadata half of `scan_keys_batch` (one pipelined TYPE plus one
+/// pipelined TTL per batch) addressed by key name instead of by scan cursor,
+/// so the key browser can fill the badges of rows it already listed without
+/// scanning the keyspace again. A key that disappeared meanwhile answers
+/// `TYPE` = "none" and `TTL` = -2.
+pub async fn key_metadata_batch<C>(con: &mut C, keys: &[Vec<u8>]) -> Result<Vec<RedisKeyMetadata>, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pipeline = Pipeline::with_capacity(keys.len() * 2);
+    for key in keys {
+        pipeline.cmd("TYPE").arg(key.as_slice());
+        pipeline.cmd("TTL").arg(key.as_slice());
+    }
+    let replies: Vec<RedisRawValue> = pipeline.query_async(con).await.map_err(|error| error.to_string())?;
+    if replies.len() != keys.len() * 2 {
+        return Err("Redis did not return one TYPE and one TTL reply per key".to_string());
+    }
+
+    let mut result = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        let key_type = String::from_redis_value(replies[index * 2].clone()).unwrap_or_default();
+        let ttl = i64::from_redis_value(replies[index * 2 + 1].clone()).unwrap_or(-2);
+        result.push(RedisKeyMetadata {
+            key_raw: redis_key_bytes_to_raw(key),
+            key_type,
+            ttl,
+        });
+    }
+    Ok(result)
 }
 
 async fn scan_keys_batch_inner<C>(
@@ -9321,6 +9373,50 @@ mod tests {
         assert_eq!(result.keys[0].ttl, -2);
         assert_eq!(con.command_count("TYPE"), 0);
         assert_eq!(con.command_count("TTL"), 0);
+    }
+
+    #[tokio::test]
+    async fn key_metadata_batch_reads_type_and_ttl_for_the_given_keys() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::Int(3600),
+            RedisRawValue::SimpleString("hash".to_string()),
+            RedisRawValue::Int(-1),
+        ]);
+
+        let result = super::key_metadata_batch(&mut con, &[b"session:a".to_vec(), b"cache:b".to_vec()]).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].key_raw, super::redis_key_bytes_to_raw(b"session:a"));
+        assert_eq!(result[0].key_type, "string");
+        assert_eq!(result[0].ttl, 3600);
+        assert_eq!(result[1].key_type, "hash");
+        assert_eq!(result[1].ttl, -1);
+        // The whole batch travels in one pipeline: one TYPE and one TTL per key.
+        let packed = &con.commands[0];
+        assert_eq!(packed.matches("\r\nTYPE\r\n").count(), 2);
+        assert_eq!(packed.matches("\r\nTTL\r\n").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn key_metadata_batch_answers_unknown_expiry_for_a_vanished_key() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::SimpleString("none".to_string()), RedisRawValue::Int(-2)]);
+
+        let result = super::key_metadata_batch(&mut con, &[b"gone".to_vec()]).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key_type, "none");
+        assert_eq!(result[0].ttl, -2);
+    }
+
+    #[tokio::test]
+    async fn key_metadata_batch_without_keys_issues_no_command() {
+        let mut con = FakeRedisConnection::new(vec![]);
+
+        let result = super::key_metadata_batch(&mut con, &[]).await.unwrap();
+
+        assert!(result.is_empty());
+        assert!(con.commands.is_empty());
     }
 
     #[tokio::test]

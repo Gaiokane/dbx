@@ -184,6 +184,7 @@ import type {
   RedisValue,
   RedisKeysExpiryResult,
   RedisScanResult,
+  RedisKeyMetadata,
   RedisCommandResult,
   RedisSlowlogEntry,
   RedisNodeEndpoint,
@@ -4061,6 +4062,14 @@ export async function redisScanKeysBatch(connectionId: string, db: number, curso
     count,
     maxIterations,
     includeTypes,
+  });
+}
+
+export async function redisKeyMetadataBatch(connectionId: string, db: number, keyRaws: string[]): Promise<RedisKeyMetadata[]> {
+  return post("/api/redis/key-metadata-batch", {
+    connectionId,
+    db,
+    keyRaws,
   });
 }
 
