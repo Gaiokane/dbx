@@ -155,8 +155,6 @@ const isFetchingAll = ref(false);
 const fetchAllSnapshotComplete = ref(false);
 const fetchAllStopRequested = ref(false);
 const fetchAllLoadedCount = ref(0);
-/** Set once a full sweep finished, so the footer can offer "Refetch all". */
-const fetchAllCompleted = ref(false);
 /** Rows whose TYPE/TTL is still unknown and waits for a metadata backfill. */
 const metadataBackfillRunning = ref(false);
 const metadataBackfillProgress = ref<{ loaded: number; total: number } | null>(null);
@@ -462,11 +460,12 @@ const fetchAllProgressText = computed(() => {
   }
   return t("redis.fetchAllProgressUnknown", { loaded: displayedKeyCount.value });
 });
-// 扫完一遍之后，同一个按钮变成“重新获取全部”：动作不变（重扫整个库），
-// 只是让用户知道当前列表已经是一次完整快照。过滤模式不提供重扫，
-// 那里按钮在扫尽后直接置灰。
-const fetchAllRescanAvailable = computed(() => !hasFilteredKeyRange.value);
-const fetchAllActionLabel = computed(() => (fetchAllCompleted.value && fetchAllRescanAvailable.value ? t("redis.refetchAllKeys") : t("redis.fetchAllKeys")));
+// 底部「获取全部」有两级语义，按“还有没有剩余”决定：
+// · 还有剩余（hasMore）→ 从当前游标续扫补齐，成本与旧版完全一致；
+// · 已经扫完 → 从游标 0 重扫整个库并替换列表，可以反复触发。
+// 过滤/搜索模式同样开放：重扫会带上当前的 pattern / 值查询条件重新扫一遍，
+// key 模式由服务端 MATCH 过滤，值搜索则仍需逐键取值后在客户端过滤。
+const fetchAllActionLabel = computed(() => (hasMore.value ? t("redis.fetchAllKeys") : t("redis.refetchAllKeys")));
 const keyCountText = computed(() => {
   if (loading.value && flatKeys.value.length === 0) return loadingEmptyText.value;
   if (!hasFilteredKeyRange.value && lastTotalKeys.value > 0) {
@@ -820,12 +819,24 @@ function recountMissingMetadata() {
   missingMetadataCount.value = countMissingMetadata(flatKeys.value);
 }
 
-/** The rows the user can currently see, so the backfill stays cheap. */
+/**
+ * The rows the user can currently see, so the backfill stays cheap.
+ *
+ * The scroller is queried defensively: it may not be mounted yet, and a
+ * partially initialised scroller does not expose the viewport helpers. In
+ * that case the backfill falls back to the head of the list, which is still
+ * a valid (if slightly less targeted) window.
+ */
 function metadataBackfillWindow(): RedisKeyTreeRow[] {
   const rows = visibleRows.value;
   if (rows.length === 0) return rows;
-  const scroller = redisKeyScroller();
-  if (!scroller) return rows.slice(0, METADATA_BACKFILL_WINDOW);
+  const scroller = redisKeyScroller() as unknown as {
+    getScroll?: () => { start: number; end: number };
+    findItemIndex?: (offset: number) => number;
+  } | null;
+  if (typeof scroller?.getScroll !== "function" || typeof scroller.findItemIndex !== "function") {
+    return rows.slice(0, METADATA_BACKFILL_WINDOW);
+  }
   const { start, end } = scroller.getScroll();
   const first = Math.max(0, scroller.findItemIndex(start));
   const lastIndex = scroller.findItemIndex(end ?? start);
@@ -851,11 +862,22 @@ function metadataBackfillCandidates(limit: number): string[] {
   return candidates;
 }
 
-/** Queues the visible rows that still miss metadata and flushes them shortly. */
+/**
+ * Queues the visible rows that still miss metadata and flushes them shortly.
+ *
+ * The backfill is a best-effort enhancement, so it must never break the load
+ * that scheduled it: any failure here is swallowed instead of rejecting the
+ * caller's promise.
+ */
 function scheduleMetadataBackfill() {
   if (!redisBrowserIsActive) return;
-  for (const keyRaw of metadataBackfillCandidates(METADATA_BACKFILL_WINDOW)) {
-    metadataBackfillQueue.add(keyRaw);
+  try {
+    for (const keyRaw of metadataBackfillCandidates(METADATA_BACKFILL_WINDOW)) {
+      metadataBackfillQueue.add(keyRaw);
+    }
+  } catch {
+    metadataBackfillQueue.clear();
+    return;
   }
   if (metadataBackfillQueue.size === 0) return;
   if (metadataBackfillTimer) return;
@@ -1426,7 +1448,6 @@ async function loadKeys() {
   rememberRedisKeySearchHistory(searchHistoryScope.value, searchPattern.value);
   const requestId = invalidateScanRequests();
   fetchAllSnapshotComplete.value = false;
-  fetchAllCompleted.value = false;
   isFetchingAll.value = false;
   fetchAllStopRequested.value = false;
   fetchAllLoadedCount.value = 0;
@@ -1815,7 +1836,6 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
         publicationSucceeded = published;
         if (published) {
           fetchAllSnapshotComplete.value = completed && fetchAllCoversScope;
-          fetchAllCompleted.value = completed;
           fetchAllPublicationRollback = null;
           if (!hasMore.value) refreshExpandedGroupIds.clear();
         }
@@ -1855,14 +1875,21 @@ function stopFetchAll() {
 /**
  * Footer entry point for the full sweep.
  *
- * In the plain key browser the button rescans the whole keyspace from cursor
- * 0 and replaces the current list, so it doubles as the "refresh everything"
- * action. A filtered sweep (key/value search, default key filter) keeps the
- * bounded continuation semantics: restarting it would walk the entire
- * keyspace again, and the search cursor must stay continuous (#7779).
+ * The button has two levels, decided by whether anything is left to fill:
+ *
+ * - "resume" (the default) continues from the current scan cursor and fills
+ *   the rest of the keyspace. This is the historical behaviour and costs
+ *   exactly what it always did.
+ * - "rescan" restarts at cursor 0 and replaces the current list with a fresh
+ *   snapshot of the whole keyspace. It is what the button becomes once the
+ *   keyspace is exhausted, and it can be triggered again and again.
+ *
+ * Both levels are available in every mode. A rescan inside a search re-runs
+ * that search: a key-mode search is filtered by the server-side MATCH, while
+ * a value search still has to fetch and match every value on the client.
  */
 function startFetchAll() {
-  const mode: FetchAllMode = hasFilteredKeyRange.value ? "resume" : "rescan";
+  const mode: FetchAllMode = hasMore.value ? "resume" : "rescan";
   void fetchAll(mode).catch((error) => toast(errorMessage(error), 5000));
 }
 
@@ -4110,14 +4137,16 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
           <!--
             底部操作区常驻，不再随 hasMore 卸载：
             · 加载更多只做增量补齐（原语义不变），扫尽后置灰并显示“已全部加载”；
-            · 获取全部改为全量重扫（从游标 0 重扫整个库并替换列表），扫完后变成“重新获取全部”。
+            · 获取全部有两级：还有剩余时从当前游标续扫补齐（与旧版一致），
+              扫完之后变成“重新加载全部”，点击则从游标 0 重扫整个库并替换列表，
+              可以反复触发。
           -->
           <div v-if="!isFetchingAll && (flatKeys.length > 0 || hasMore)" class="shrink-0 border-t px-2 py-1.5 flex items-center gap-1.5">
             <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loadingMore || loading || searchPending || mutatingKeys || !hasMore" :title="hasMore ? undefined : t('redis.loadMoreAllLoadedHint')" data-redis-load-more @click="loadMore()">
               <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
               {{ hasMore ? t("redis.loadMoreKeys") : t("redis.allKeysLoaded") }}
             </Button>
-            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loading || searchPending || mutatingKeys || (!fetchAllRescanAvailable && !hasMore)" :title="t('redis.refetchAllKeysHint')" data-redis-fetch-all @click="startFetchAll">
+            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loading || searchPending || mutatingKeys" :title="hasMore ? t('redis.fetchAllKeysHint') : t('redis.refetchAllKeysHint')" data-redis-fetch-all @click="startFetchAll">
               {{ fetchAllActionLabel }}
             </Button>
           </div>

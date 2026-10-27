@@ -2233,12 +2233,12 @@ describe("RedisKeyBrowser interrupted Fetch All", () => {
     await submitKeySearch("group:second");
 
     expect(document.querySelector(`[data-redis-leaf="${buffered.key_raw}"]`)).not.toBeNull();
-    // The footer action rescans from cursor 0, so the sweep costs one extra
-    // round trip compared to a continuation of the previous cursor.
-    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(3);
-    // An interrupted sweep never completes, so the action bar still offers the
-    // first full sweep — and it stays visible instead of disappearing.
-    expect(document.body.textContent).toContain("redis.fetchAllKeys");
+    // The first footer click continues from the current cursor, so the sweep
+    // costs the same round trip as before.
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(2);
+    // The sweep completed, so the action bar keeps offering the full reload
+    // instead of disappearing together with the exhausted button.
+    expect(document.body.textContent).toContain("redis.refetchAllKeys");
   });
 
   it("filters a completed Fetch All snapshot while editing a key search", async () => {

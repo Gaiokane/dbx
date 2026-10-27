@@ -1255,10 +1255,13 @@ describe("RedisKeyBrowser group subtree fill on expand (issue #7162)", () => {
   });
 });
 
-// The footer is a permanent action bar: "Load more" only fills the rest of
-// the keyspace (unchanged semantics), while "Fetch all" became a full rescan
-// that can be repeated. The bar used to disappear as soon as the scan cursor
-// reached the end, which left the user without any way to refresh the list.
+// The footer is a permanent action bar. "Load more" only fills the rest of
+// the keyspace (unchanged semantics). "Fetch all" has two levels: while
+// something is left to fill it continues from the current scan cursor (the
+// historical behaviour), and once the keyspace is exhausted it turns into
+// "Reload all", which rescans from cursor 0 and can be repeated. The bar used
+// to disappear as soon as the scan cursor reached the end, which left the
+// user without any way to refresh the list.
 describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
   it("keeps the footer visible after the keyspace was scanned completely", async () => {
     mocks.infiniteScroll = false;
@@ -1273,28 +1276,41 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(fetchAll, "fetch all button").not.toBeNull();
     // Nothing left to fill: the button stays visible but disabled.
     expect(loadMore!.disabled).toBe(true);
+    // Nothing is left to fill either, so the action becomes the full reload.
     expect(fetchAll!.disabled).toBe(false);
+    expect(fetchAll!.textContent).toContain("redis.refetchAllKeys");
   });
 
-  it("rescans the whole database from cursor 0 and offers a refetch afterwards", async () => {
+  it("fills the rest of the keyspace first and only rescans from cursor 0 on the second click", async () => {
     mocks.infiniteScroll = false;
-    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfo("a")], total_keys: 1 });
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
+      if (cursor === 0) return Promise.resolve({ cursor: 42, keys: [keyInfo("a")], total_keys: 10 });
+      return Promise.resolve({ cursor: 0, keys: [keyInfo("b")], total_keys: 10 });
+    });
 
     const host = mountBrowser();
     await settleThoroughly();
 
     const fetchAll = host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!;
+    // Something is left to fill, so the button offers the continuation.
     expect(fetchAll.textContent).toContain("redis.fetchAllKeys");
 
-    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfo("a"), keyInfo("b")], total_keys: 2 });
+    const callsBeforeFill = mocks.redisScanKeysBatch.mock.calls.length;
     fetchAll.click();
     await settleThoroughly();
 
-    // The sweep restarts at cursor 0 instead of continuing an exhausted one.
-    const scanCalls = mocks.redisScanKeysBatch.mock.calls;
-    expect(scanCalls[scanCalls.length - 1]?.[2]).toBe(0);
-    // A finished sweep turns the same button into the repeat action.
+    // The first click continues from the current cursor instead of starting over.
+    expect(mocks.redisScanKeysBatch.mock.calls[callsBeforeFill]?.[2]).toBe(42);
+    expect(host.textContent).toContain("b");
+    // The finished sweep turns the same button into the reload action.
     expect(host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.textContent).toContain("redis.refetchAllKeys");
+
+    const callsBeforeReload = mocks.redisScanKeysBatch.mock.calls.length;
+    host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.click();
+    await settleThoroughly();
+
+    // The second click restarts at cursor 0 and replaces the current list.
+    expect(mocks.redisScanKeysBatch.mock.calls[callsBeforeReload]?.[2]).toBe(0);
   });
 
   it("keeps the load-more action incremental instead of rescanning", async () => {
