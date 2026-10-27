@@ -1313,6 +1313,55 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(mocks.redisScanKeysBatch.mock.calls[callsBeforeReload]?.[2]).toBe(0);
   });
 
+  it("clears the list when a reload finds no keys at all", async () => {
+    mocks.infiniteScroll = false;
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [{ ...keyInfo("a"), key_raw: btoa("a") }], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+
+    const leaf = `[data-redis-leaf="${btoa("a")}"]`;
+    expect(host.querySelector(leaf)).not.toBeNull();
+
+    // Every key is gone, so the reload has to publish an empty snapshot
+    // instead of keeping the rows of the previous one.
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [], total_keys: 0 });
+    const fetchAll = host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!;
+    expect(fetchAll.textContent).toContain("redis.refetchAllKeys");
+    fetchAll.click();
+    await settleThoroughly();
+
+    expect(host.querySelector(leaf)).toBeNull();
+  });
+
+  it("drops a row from the no-expiry filter once the server resolves its expiry", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const leaf = `[data-redis-leaf="${btoa("a")}"]`;
+    expect(host.querySelector(leaf)).not.toBeNull();
+
+    // An unknown expiry is a member of the "no expiry" filter until the
+    // server says the key really expires.
+    host.querySelector<HTMLButtonElement>("[data-redis-no-expiry-filter]")!.click();
+    await settleThoroughly();
+    expect(host.querySelector(leaf)).not.toBeNull();
+
+    // The server answers with a real expiry, so the row leaves the filter.
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "string", ttl: 3600 }]);
+    host.querySelector<HTMLButtonElement>("[data-redis-backfill-metadata]")!.click();
+    await settleThoroughly();
+
+    expect(host.querySelector(leaf)).toBeNull();
+  });
+
   it("keeps the load-more action incremental instead of rescanning", async () => {
     mocks.infiniteScroll = false;
     mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {

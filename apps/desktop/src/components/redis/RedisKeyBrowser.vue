@@ -66,6 +66,7 @@ import { redisFuzzySearchScanBudget, createRedisKeyPatternMatcher, redisKeySearc
 import { filterRedisKeyTemplates, resolveRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 import { forgetRedisKeySearchHistory, loadRedisKeySearchHistory, rememberRedisKeySearchHistory, type RedisKeySearchHistoryScope } from "@/lib/redis/redisKeySearchHistory";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
+import { redisFetchAllShouldInlineMetadata, trimRedisMetadataBackfillQueue } from "@/lib/redis/redisKeyMetadata";
 import { chunkRedisKeyRaws, collectUniqueRedisKeys } from "@/lib/redis/redisKeyBatch";
 import { getRedisCreateKeyTypeHelp, redisCreateKeyTypeHelpOptionOnOpen, shouldActivateRedisCreateKeyTypeHelpOnFocus } from "@/lib/redis/redisCreateKeyTypeHelp";
 import { optionHelpPanelOffsetTop } from "@/lib/common/optionHelpPanelOffset";
@@ -691,6 +692,9 @@ function rollbackFetchAllPublication() {
   flatKeys.value = rollback.flatKeys;
   flatKeyByRaw = rollback.flatKeyByRaw;
   loadedKeyRaws = rollback.loadedKeyRaws;
+  // The restored list is not the one the metadata counter was computed for,
+  // so the counter has to follow the list again.
+  recountMissingMetadata();
   treeKeys.value = rollback.treeKeys;
   treeIndex = rollback.treeIndex;
   expandedGroupIds.value = rollback.expandedGroupIds;
@@ -754,14 +758,13 @@ function recordKeyTtlObservedAt(key: RedisKeyInfo) {
 // ---------------------------------------------------------------------------
 // Metadata backfill
 //
-// A full sweep only inlines TYPE/TTL for small keyspaces: the driver refuses
-// that cost for million-key databases. Those databases are listed by name and
-// their badges are filled in afterwards — for the rows the user can actually
-// see, or for every loaded row on demand.
+// A full sweep inlines TYPE/TTL only for a bounded number of keys, so the
+// metadata commands of one sweep never scale with the size of the keyspace.
+// The keys beyond that budget are listed by name and their badges are filled
+// in afterwards — for the rows the user can actually see, or for every loaded
+// row on demand.
 // ---------------------------------------------------------------------------
 
-/** Databases up to this size get TYPE/TTL inline while the sweep runs. */
-const FETCH_ALL_INLINE_METADATA_MAX_KEYS = 50_000;
 /** Keys resolved per backend round trip. */
 const METADATA_BACKFILL_BATCH_SIZE = 500;
 /** Rows inspected per backfill trigger. */
@@ -770,14 +773,9 @@ const METADATA_BACKFILL_WINDOW = 400;
 /** Keys whose metadata was already resolved, so they are never asked twice. */
 const metadataResolvedRaws = new Set<string>();
 const metadataBackfillQueue = new Set<string>();
+/** Keys whose metadata the server answered for since the last full load. */
+const metadataResolvedCount = ref(0);
 let metadataBackfillTimer: ReturnType<typeof setTimeout> | null = null;
-
-function fetchAllInlineMetadataEnabled(): boolean {
-  // A filtered sweep (key search / default key filter) matches an unknown
-  // number of keys, so it never pays for inline metadata up front.
-  if (hasFilteredKeyRange.value) return false;
-  return lastTotalKeys.value <= FETCH_ALL_INLINE_METADATA_MAX_KEYS;
-}
 
 /** Drops the TTL observation records of keys that are no longer listed. */
 function pruneTtlObservationCache(keep: ReadonlySet<string>) {
@@ -791,6 +789,7 @@ function pruneTtlObservationCache(keep: ReadonlySet<string>) {
 function resetMetadataBackfillState() {
   metadataResolvedRaws.clear();
   metadataBackfillQueue.clear();
+  metadataResolvedCount.value = 0;
   metadataBackfillProgress.value = null;
   if (metadataBackfillTimer) {
     clearTimeout(metadataBackfillTimer);
@@ -810,7 +809,9 @@ const missingMetadataCount = ref(0);
 function countMissingMetadata(keys: readonly RedisKeyInfo[]): number {
   let missing = 0;
   for (const key of keys) {
-    if (redisKeyNeedsMetadata(key)) missing++;
+    // A key the server already answered for is resolved, not missing: its
+    // answer may well be "the key does not exist any more".
+    if (redisKeyNeedsMetadata(key) && !metadataResolvedRaws.has(key.key_raw)) missing++;
   }
   return missing;
 }
@@ -868,6 +869,11 @@ function metadataBackfillCandidates(limit: number): string[] {
  * The backfill is a best-effort enhancement, so it must never break the load
  * that scheduled it: any failure here is swallowed instead of rejecting the
  * caller's promise.
+ *
+ * The visible window can queue faster than the backend answers, so the queue
+ * is capped. The oldest entries are dropped first: they belong to rows the
+ * user scrolled past, and their badges are filled in again when they are
+ * listed anew.
  */
 function scheduleMetadataBackfill() {
   if (!redisBrowserIsActive) return;
@@ -875,6 +881,7 @@ function scheduleMetadataBackfill() {
     for (const keyRaw of metadataBackfillCandidates(METADATA_BACKFILL_WINDOW)) {
       metadataBackfillQueue.add(keyRaw);
     }
+    trimRedisMetadataBackfillQueue(metadataBackfillQueue);
   } catch {
     metadataBackfillQueue.clear();
     return;
@@ -890,32 +897,38 @@ function scheduleMetadataBackfill() {
 /** Writes resolved metadata back into the flat list and the tree. */
 function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
   let changed = false;
-  let resolved = 0;
   let noExpiryMembershipChanged = false;
   for (const entry of metadata) {
     const existing = flatKeyByRaw.get(entry.key_raw);
     if (!existing) continue;
+    // A key the server answered for is resolved, even when the answer is
+    // "the key does not exist any more": it will never be asked again, so it
+    // must stop counting as a key whose metadata is missing.
+    const wasMissing = redisKeyNeedsMetadata(existing) && !metadataResolvedRaws.has(entry.key_raw);
     metadataResolvedRaws.add(entry.key_raw);
-    resolved++;
+    if (wasMissing) {
+      metadataResolvedCount.value++;
+      missingMetadataCount.value = Math.max(0, missingMetadataCount.value - 1);
+    }
     const previousTtl = existing.ttl ?? -2;
     const nextType = entry.key_type || existing.key_type;
     const nextTtl = entry.ttl;
     if (previousTtl === nextTtl && existing.key_type === nextType) continue;
-    if ((previousTtl === -1) !== (nextTtl === -1)) noExpiryMembershipChanged = true;
+    // The filter membership follows the projection predicate, not the raw
+    // TTL: an unknown TTL (-2) is a member until it is resolved, so only the
+    // predicate knows whether the row belongs into the projection.
+    if (redisKeyPassesNoExpiryFilter({ ttl: previousTtl }) !== redisKeyPassesNoExpiryFilter({ ttl: nextTtl })) {
+      noExpiryMembershipChanged = true;
+    }
     // The metadata write mutates the listed record in place, so the previous
     // state has to be captured before it happens.
-    const previouslyNeeded = redisKeyNeedsMetadata(existing);
     const next: RedisKeyInfo = { ...existing, key_type: nextType, ttl: nextTtl };
     updateRedisKeyInfoMetadataByRaw(flatKeyByRaw, next);
     if (treeIndex) updateRedisKeyTreeLeafMetadata(treeIndex, next);
     recordKeyTtlObservedAt(next);
     changed = true;
-    // The row no longer misses metadata once the server answered for it.
-    if (previouslyNeeded && !redisKeyNeedsMetadata(next)) {
-      missingMetadataCount.value = Math.max(0, missingMetadataCount.value - 1);
-    }
   }
-  if (!changed && resolved === 0) return;
+  if (!changed) return;
   if (noExpiryMembershipChanged) noExpiryProjectionEpoch.value++;
   keyMetadataEpoch.value++;
   syncListTtlTimer();
@@ -934,6 +947,7 @@ async function flushMetadataBackfill() {
     // rows that no longer exist and must not be written back.
     if (requestId !== searchRequestId) return;
     applyMetadataBatch(metadata);
+    metadataBackfillProgress.value = { loaded: metadataResolvedCount.value, total: metadataResolvedCount.value + missingMetadataCount.value };
   } catch (error) {
     // A failed batch keeps the rows unresolved instead of retrying forever;
     // the next trigger asks again.
@@ -951,11 +965,16 @@ async function backfillAllKeyMetadata() {
   if (pending.length === 0) return;
   metadataBackfillRunning.value = true;
   metadataBackfillProgress.value = { loaded: 0, total: pending.length };
+  const requestId = searchRequestId;
   try {
     for (let offset = 0; offset < pending.length; offset += METADATA_BACKFILL_BATCH_SIZE) {
       if (!redisBrowserIsActive) return;
+      // A later load replaced the list: the remaining batches belong to rows
+      // that no longer exist and must not be asked for.
+      if (requestId !== searchRequestId) return;
       const batch = pending.slice(offset, offset + METADATA_BACKFILL_BATCH_SIZE).map((key) => key.key_raw);
       const metadata = await api.redisKeyMetadataBatch(props.connectionId, props.db, batch);
+      if (requestId !== searchRequestId) return;
       applyMetadataBatch(metadata);
       metadataBackfillProgress.value = { loaded: Math.min(offset + batch.length, pending.length), total: pending.length };
     }
@@ -1578,12 +1597,14 @@ function onRedisKeyScroll(event: Event) {
     redisKeyScrollRevision++;
     latestRedisKeyScrollAnchor = captureRedisKeyViewportAnchor(redisKeyScrollRevision);
   }
-  // Rows that scrolled into view may still miss their type badge and TTL
-  // because the sweep skipped metadata for a large keyspace.
-  scheduleMetadataBackfill();
   if (redisInfiniteScrollFrame) return;
   redisInfiniteScrollFrame = requestAnimationFrame(() => {
     redisInfiniteScrollFrame = 0;
+    // Rows that scrolled into view may still miss their type badge and TTL
+    // because the sweep skipped metadata for the keys beyond its budget.
+    // The scan of the visible window runs inside the frame callback: a raw
+    // scroll event fires far more often than the display refreshes.
+    scheduleMetadataBackfill();
     const shouldLoad = shouldLoadMoreRedisKeys({
       enabled: redisInfiniteScrollEnabled.value,
       hasMore: hasMore.value,
@@ -1776,16 +1797,23 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
     scanCursor.value = 0;
     hasMore.value = true;
     loadedKeyRaws = new Set<string>();
+    // The previous sweep's snapshot no longer describes the list once the
+    // rescan starts replacing it.
+    fetchAllSnapshotComplete.value = false;
   }
   fetchAllLoadedCount.value = rescan ? 0 : flatKeys.value.length;
   let changed = false;
   let completed = false;
   let publicationSucceeded = true;
-  // Small databases get TYPE/TTL inline, so the badges are exact the moment
-  // the sweep finishes. Large ones skip the metadata in the scan itself (the
-  // driver refuses that cost for million-key databases) and get it filled in
-  // afterwards for the rows that are actually shown.
-  let includeTypes = fetchAllInlineMetadataEnabled();
+  // The sweep pays for inline TYPE/TTL metadata only for a bounded number of
+  // keys. The first batch is inlined unconditionally — the scan asks Redis for
+  // COUNT keys per round trip, so that batch costs at most 2 * COUNT
+  // commands. Every later batch is inlined only while the running total stays
+  // inside the budget, which keeps one sweep at that order of magnitude no
+  // matter how large the keyspace is. The keys beyond the budget are filled in
+  // afterwards, for the rows the user actually looks at.
+  let inlineMetadataKeys = 0;
+  let includeTypes = true;
   try {
     while (requestId === searchRequestId && !fetchAllStopRequested.value && hasMore.value) {
       const result = await fetchScanBatchPage(FETCH_ALL_BATCH_ITERATIONS, {
@@ -1795,11 +1823,12 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
       if (requestId !== searchRequestId) break;
       changed = bufferFetchAllScanResult(result, bufferedKeys, bufferedKeyRaws, rescan ? 0 : flatKeys.value.length) > 0 || changed;
       fetchAllLoadedCount.value = (rescan ? 0 : flatKeys.value.length) + bufferedKeys.length;
-      // The first batch reports the real keyspace size (DBSIZE travels with
-      // cursor 0). Degrade immediately when it turns out to be huge, so the
-      // remaining batches never pay for inline metadata.
-      if (includeTypes && result.total_keys > FETCH_ALL_INLINE_METADATA_MAX_KEYS) {
-        includeTypes = false;
+      if (includeTypes) {
+        // The budget counts the keys the sweep already asked the server
+        // about, so it holds for every mode: a continuation, a rescan and a
+        // filtered sweep all count the keys they actually matched.
+        inlineMetadataKeys += result.keys.length;
+        if (!redisFetchAllShouldInlineMetadata(inlineMetadataKeys)) includeTypes = false;
       }
     }
     completed = requestId === searchRequestId && !fetchAllStopRequested.value && !hasMore.value;
@@ -1807,7 +1836,10 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
     if (requestId === searchRequestId) {
       let published = !changed && !fetchAllStopRequested.value;
       try {
-        if (changed) {
+        // A rescan has to publish even when it found nothing: the point of
+        // the action is to replace the list with the current state of the
+        // database, and an empty database means an empty list.
+        if (rescan || changed) {
           const seedBatches = rescan ? [bufferedKeys] : [initialFlatKeys, bufferedKeys];
           snapshotConfig.flatRows = customGrouping.value.enabled || useFlatSearchResults(seedBatches.reduce((total, batch) => total + batch.length, 0));
           snapshotConfig.expandAll = false;
@@ -1821,14 +1853,16 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
             flatKeys.value = snapshot.flatKeys;
             flatKeyByRaw = snapshot.flatKeyByRaw;
             loadedKeyRaws = snapshot.loadedKeyRaws;
-            recountMissingMetadata();
             treeIndex = snapshot.treeIndex;
             treeKeys.value = snapshot.treeIndex?.root ?? [];
             expandedGroupIds.value = snapshot.expandedGroupIds;
             fetchAllFilteredKeyCount.value = snapshotConfig.noExpiryOnly ? snapshot.filteredKeyCount : null;
             refreshSelectedGroupLeafCounts();
             pruneTtlObservationCache(snapshot.loadedKeyRaws);
+            // The resolved set belongs to the previous list, so it is dropped
+            // before the counter is recomputed for the new one.
             resetMetadataBackfillState();
+            recountMissingMetadata();
             published = await publishFetchAllVisibleRows(snapshot.visibleRows, requestId);
           }
         }
@@ -2202,7 +2236,7 @@ function onKeyLoaded(value: RedisValue) {
   }
   const keyInfo = redisValueToKeyInfo(value);
   const previousTtl = flatKeyByRaw.get(keyInfo.key_raw)?.ttl ?? -2;
-  const noExpiryMembershipChanged = (previousTtl === -1) !== (keyInfo.ttl === -1);
+  const noExpiryMembershipChanged = redisKeyPassesNoExpiryFilter({ ttl: previousTtl }) !== redisKeyPassesNoExpiryFilter(keyInfo);
   if (!updateRedisKeyInfoMetadataByRaw(flatKeyByRaw, keyInfo)) return;
   if (groupRefresh.value) invalidateScanRequests(false);
   // 详情面板回写了最新的 TTL，同步刷新观测时刻，保证两侧倒计时一致
@@ -2469,7 +2503,7 @@ function applyKeyTtlMetadata(keyRaw: string, ttl: number): boolean {
   if (groupRefresh.value) invalidateScanRequests(false);
   recordKeyTtlObservedAt(nextKeyInfo);
   if (treeIndex) updateRedisKeyTreeLeafMetadata(treeIndex, nextKeyInfo);
-  return (previousTtl === -1) !== (ttl === -1);
+  return redisKeyPassesNoExpiryFilter({ ttl: previousTtl }) !== redisKeyPassesNoExpiryFilter({ ttl });
 }
 
 function applyBatchExpiryMetadata(keyRaws: readonly string[], policy: RedisExpiryPolicy) {

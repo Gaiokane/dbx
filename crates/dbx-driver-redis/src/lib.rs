@@ -52,6 +52,14 @@ const COLLECTION_OVERFLOW_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const COLLECTION_OVERFLOW_CURSOR_START: u64 = 1 << 52;
 const INVALID_CLUSTER_SCAN_CURSOR_ERROR: &str = "Redis cluster scan cursor is invalid or expired";
 const MAX_SAFE_INTEGER_CURSOR: u64 = (1 << 53) - 1;
+/// Keys per packed round trip when a scan batch also asks for TYPE and TTL.
+///
+/// The scan itself may return tens of thousands of keys in one batch, but the
+/// metadata pipeline is split into chunks of this size: one round trip then
+/// carries at most `2 * SCAN_METADATA_PIPELINE_CHUNK` commands, which keeps
+/// the single-threaded server responsive for the other clients of the
+/// instance.
+const SCAN_METADATA_PIPELINE_CHUNK: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisDatabaseInfo {
@@ -3276,24 +3284,41 @@ where
 
         if !keys.is_empty() {
             let (key_types, key_ttls): (Vec<String>, Vec<i64>) = if include_types {
-                let mut type_pipe = redis::pipe();
-                for key in &keys {
-                    type_pipe.cmd("TYPE").arg(key);
-                }
-                let type_count = type_pipe.len();
-                let type_values = con.req_packed_commands(&type_pipe, 0, type_count).await.unwrap_or_default();
-                let key_types = type_values
-                    .iter()
-                    .map(|value| String::from_redis_value(value.clone()).unwrap_or_else(|_| "unknown".to_string()))
-                    .collect();
+                let mut key_types: Vec<String> = Vec::with_capacity(keys.len());
+                let mut key_ttls: Vec<i64> = Vec::with_capacity(keys.len());
+                // One packed pipeline per chunk keeps a single round trip bounded.
+                // The whole batch would otherwise ask the server for tens of
+                // thousands of TYPE and TTL commands at once, and Redis answers
+                // them one after another on its single thread — every other
+                // client of that instance waits for the whole batch.
+                for chunk in keys.chunks(SCAN_METADATA_PIPELINE_CHUNK) {
+                    let mut type_pipe = redis::pipe();
+                    for key in chunk {
+                        type_pipe.cmd("TYPE").arg(key);
+                    }
+                    let type_count = type_pipe.len();
+                    let type_values = con.req_packed_commands(&type_pipe, 0, type_count).await.unwrap_or_default();
+                    // The replies are read per index so a chunk that comes back
+                    // short cannot shift the metadata of the following keys.
+                    for index in 0..chunk.len() {
+                        key_types.push(
+                            type_values
+                                .get(index)
+                                .and_then(|value| String::from_redis_value(value.clone()).ok())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        );
+                    }
 
-                let mut ttl_pipe = redis::pipe();
-                for key in &keys {
-                    ttl_pipe.cmd("TTL").arg(key);
+                    let mut ttl_pipe = redis::pipe();
+                    for key in chunk {
+                        ttl_pipe.cmd("TTL").arg(key);
+                    }
+                    let ttl_count = ttl_pipe.len();
+                    let ttl_values = con.req_packed_commands(&ttl_pipe, 0, ttl_count).await.unwrap_or_default();
+                    for index in 0..chunk.len() {
+                        key_ttls.push(ttl_values.get(index).and_then(|value| i64::from_redis_value(value.clone()).ok()).unwrap_or(-2));
+                    }
                 }
-                let ttl_count = ttl_pipe.len();
-                let ttl_values = con.req_packed_commands(&ttl_pipe, 0, ttl_count).await.unwrap_or_default();
-                let key_ttls = ttl_values.into_iter().map(|value| i64::from_redis_value(value).unwrap_or(-2)).collect();
                 (key_types, key_ttls)
             } else {
                 (Vec::new(), Vec::new())
@@ -9339,6 +9364,40 @@ mod tests {
         assert_eq!(type_pipeline.matches("\r\nTTL\r\n").count(), 0);
         assert_eq!(ttl_pipeline.matches("\r\nTYPE\r\n").count(), 0);
         assert_eq!(ttl_pipeline.matches("\r\nTTL\r\n").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_splits_the_metadata_pipeline_into_bounded_chunks() {
+        let chunk = super::SCAN_METADATA_PIPELINE_CHUNK;
+        let key_count = chunk + 1;
+        let key_names: Vec<String> = (0..key_count).map(|index| format!("key:{index}")).collect();
+        let key_refs: Vec<&str> = key_names.iter().map(|name| name.as_str()).collect();
+
+        let mut responses = vec![RedisRawValue::Int(key_count as i64), scan_response("0", key_refs)];
+        responses.extend((0..chunk).map(|_| RedisRawValue::SimpleString("string".to_string())));
+        responses.extend((0..chunk).map(|_| RedisRawValue::Int(60)));
+        // The tail chunk holds the single remaining key.
+        responses.push(RedisRawValue::SimpleString("hash".to_string()));
+        responses.push(RedisRawValue::Int(30));
+
+        let mut con = FakeRedisConnection::new(responses);
+        let result = super::scan_keys_batch(&mut con, 0, "*", 1000, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), key_count);
+        // Every key keeps its own metadata even though the pipeline was split.
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, 60);
+        assert_eq!(result.keys[chunk - 1].key_type, "string");
+        assert_eq!(result.keys[chunk - 1].ttl, 60);
+        assert_eq!(result.keys[chunk].key_type, "hash");
+        assert_eq!(result.keys[chunk].ttl, 30);
+
+        // The metadata never travels in one oversized round trip: every packed
+        // command carries at most one chunk worth of TYPE commands.
+        let type_pipelines: Vec<&String> = con.commands.iter().filter(|packed| packed.contains("\r\nTYPE\r\n")).collect();
+        assert_eq!(type_pipelines.len(), 2);
+        assert_eq!(type_pipelines[0].matches("\r\nTYPE\r\n").count(), chunk);
+        assert_eq!(type_pipelines[1].matches("\r\nTYPE\r\n").count(), 1);
     }
 
     #[tokio::test]
