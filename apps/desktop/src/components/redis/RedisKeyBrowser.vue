@@ -898,9 +898,17 @@ function scheduleMetadataBackfill() {
 function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
   let changed = false;
   let noExpiryMembershipChanged = false;
+  const vanishedKeyRaws = new Set<string>();
   for (const entry of metadata) {
     const existing = flatKeyByRaw.get(entry.key_raw);
     if (!existing) continue;
+    // The server answered "none": the key does not exist any more. It leaves
+    // the list instead of staying behind as a row whose expiry is unknown.
+    if (entry.key_type === "none") {
+      vanishedKeyRaws.add(entry.key_raw);
+      metadataResolvedRaws.add(entry.key_raw);
+      continue;
+    }
     // A key the server answered for is resolved, even when the answer is
     // "the key does not exist any more": it will never be asked again, so it
     // must stop counting as a key whose metadata is missing.
@@ -928,6 +936,13 @@ function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
     recordKeyTtlObservedAt(next);
     changed = true;
   }
+  if (vanishedKeyRaws.size > 0) {
+    // The rows are gone, so the list and the tree are rebuilt for them.
+    removeKnownKeys(vanishedKeyRaws);
+  }
+  // The epochs are bumped even when a key vanished: the metadata of the other
+  // keys was written in place, and the epoch is what makes the rows re-render
+  // with the new type badge and TTL. It must not depend on the removal path.
   if (!changed) return;
   if (noExpiryMembershipChanged) noExpiryProjectionEpoch.value++;
   keyMetadataEpoch.value++;
@@ -2146,15 +2161,28 @@ function onRowClick(node: RedisKeyTreeNode, event?: MouseEvent) {
   activeSidePanel.value = "detail";
 }
 
-function removeKnownKey(keyRaw: string) {
-  if (!flatKeyByRaw.has(keyRaw)) return;
+/**
+ * Removes keys that no longer exist.
+ *
+ * A batch of vanished keys is removed in one pass: rebuilding the list and
+ * the tree once per key would cost O(keys * list) on a large keyspace.
+ */
+function removeKnownKeys(keyRaws: ReadonlySet<string>) {
+  const present = new Set<string>();
+  for (const keyRaw of keyRaws) {
+    if (flatKeyByRaw.has(keyRaw)) present.add(keyRaw);
+  }
+  if (present.size === 0) return;
   const reloadSearch = localKeySearchActive.value;
   invalidateFetchAllForStructuralMutation();
-  loadedKeyRaws.delete(keyRaw);
-  ttlObservedAtByRaw.delete(keyRaw);
-  positiveTtlKeyRaws.delete(keyRaw);
-  replaceFlatKeyRecords(flatKeys.value.filter((key) => key.key_raw !== keyRaw));
-  if (selectedKeyRaw.value === keyRaw) selectedKeyRaw.value = null;
+  for (const keyRaw of present) {
+    loadedKeyRaws.delete(keyRaw);
+    ttlObservedAtByRaw.delete(keyRaw);
+    positiveTtlKeyRaws.delete(keyRaw);
+    metadataResolvedRaws.add(keyRaw);
+    if (selectedKeyRaw.value === keyRaw) selectedKeyRaw.value = null;
+  }
+  replaceFlatKeyRecords(flatKeys.value.filter((key) => !present.has(key.key_raw)));
   if (useFlatKeySearchRows.value) {
     treeKeys.value = [];
     treeIndex = null;
@@ -2164,7 +2192,7 @@ function removeKnownKey(keyRaw: string) {
   }
   connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, {
     loaded: hasFilteredKeyRange.value ? undefined : flatKeys.value.length,
-    totalDelta: -1,
+    totalDelta: -present.size,
   });
   // The remaining records still cover the old complete scope. Once that cache
   // is invalidated, reload the active query instead of displaying every record.
@@ -2172,6 +2200,10 @@ function removeKnownKey(keyRaw: string) {
     if (redisBrowserIsActive) void loadKeys();
     else reloadKeysOnActivation = true;
   }
+}
+
+function removeKnownKey(keyRaw: string) {
+  removeKnownKeys(new Set([keyRaw]));
 }
 
 function onKeyDeleted(keyRaw: string) {

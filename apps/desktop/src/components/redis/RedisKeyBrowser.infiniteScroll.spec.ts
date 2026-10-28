@@ -1362,6 +1362,98 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(host.querySelector(leaf)).toBeNull();
   });
 
+  it("removes a key that the server reports as gone during the backfill", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const leaf = `[data-redis-leaf="${btoa("a")}"]`;
+    expect(host.querySelector(leaf)).not.toBeNull();
+
+    // The server answers that the key does not exist any more, so it leaves
+    // the list instead of staying behind with an unknown expiry.
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "none", ttl: -2 }]);
+    host.querySelector<HTMLButtonElement>("[data-redis-backfill-metadata]")!.click();
+    await settleThoroughly();
+
+    expect(host.querySelector(leaf)).toBeNull();
+  });
+
+  it("still refreshes the other rows when a batch also reports a gone key", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = (name: string) => ({ key_display: name, key_raw: btoa(name), key_type: "", ttl: -2, size: 0, value_preview: "" });
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata("a"), withoutMetadata("b")], total_keys: 2 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const goneLeaf = `[data-redis-leaf="${btoa("a")}"]`;
+    const keptLeaf = `[data-redis-leaf="${btoa("b")}"]`;
+    // The badge lives in the row, not in the checkbox of the leaf.
+    const keptRow = `[data-redis-key-raw="${btoa("b")}"]`;
+    expect(host.querySelector(goneLeaf)).not.toBeNull();
+    expect(host.querySelector(keptLeaf)).not.toBeNull();
+    // The type badge only shows up once the server answered for the key.
+    expect(host.querySelector(keptRow)!.textContent).not.toContain("string");
+
+    // One key is gone, the other one gets its real type and expiry.
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([
+      { key_raw: btoa("a"), key_type: "none", ttl: -2 },
+      { key_raw: btoa("b"), key_type: "string", ttl: 3600 },
+    ]);
+    host.querySelector<HTMLButtonElement>("[data-redis-backfill-metadata]")!.click();
+    await settleThoroughly();
+
+    expect(host.querySelector(goneLeaf)).toBeNull();
+    // The row that survived still has to show the metadata of this batch.
+    expect(host.querySelector(keptRow)!.textContent).toContain("string");
+  });
+
+  it("removes the gone key from the Fetch All snapshot and refreshes the other rows", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = (name: string) => ({ key_display: name, key_raw: btoa(name), key_type: "", ttl: -2, size: 0, value_preview: "" });
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
+      if (cursor === 0) return Promise.resolve({ cursor: 0, keys: [withoutMetadata("a"), withoutMetadata("b")], total_keys: 2 });
+      return Promise.resolve({ cursor: 0, keys: [], total_keys: 0 });
+    });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+
+    // The sweep publishes a stable row snapshot: the rendered rows do not
+    // follow the flat list any more.
+    host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.click();
+    await settleThoroughly();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const keptRow = `[data-redis-key-raw="${btoa("b")}"]`;
+    expect(host.querySelector(keptRow)).not.toBeNull();
+    expect(host.querySelector(keptRow)!.textContent).not.toContain("string");
+    const goneRow = `[data-redis-key-raw="${btoa("a")}"]`;
+    expect(host.querySelector(goneRow)).not.toBeNull();
+
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([
+      { key_raw: btoa("a"), key_type: "none", ttl: -2 },
+      { key_raw: btoa("b"), key_type: "string", ttl: 3600 },
+    ]);
+    host.querySelector<HTMLButtonElement>("[data-redis-backfill-metadata]")!.click();
+    await settleThoroughly();
+
+    // The row of the vanished key leaves the published snapshot as well.
+    expect(host.querySelector(goneRow)).toBeNull();
+    expect(host.querySelector(keptRow)!.textContent).toContain("string");
+  });
+
   it("keeps the load-more action incremental instead of rescanning", async () => {
     mocks.infiniteScroll = false;
     mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
