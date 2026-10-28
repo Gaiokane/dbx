@@ -4208,7 +4208,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
               可以反复触发。
           -->
           <div v-if="!isFetchingAll && (flatKeys.length > 0 || hasMore)" class="shrink-0 border-t px-2 py-1.5 flex items-center gap-1.5">
-            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loadingMore || loading || searchPending || mutatingKeys || !hasMore" :title="hasMore ? undefined : t('redis.loadMoreAllLoadedHint')" data-redis-load-more @click="loadMore()">
+            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loadingMore || loading || searchPending || mutatingKeys || !hasMore" :title="hasMore ? t('redis.loadMoreKeysHint') : t('redis.loadMoreAllLoadedHint')" data-redis-load-more @click="loadMore()">
               <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
               {{ hasMore ? t("redis.loadMoreKeys") : t("redis.allKeysLoaded") }}
             </Button>
@@ -4229,7 +4229,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
             <div class="text-xs text-muted-foreground text-center">
               {{ fetchAllProgressText }}
             </div>
-            <Button variant="destructive" size="sm" class="h-7 text-xs w-full" :disabled="fetchAllStopRequested || mutatingKeys" @click="stopFetchAll">
+            <Button variant="destructive" size="sm" class="h-7 text-xs w-full" :disabled="fetchAllStopRequested || mutatingKeys" :title="t('redis.stopFetchAllHint')" @click="stopFetchAll">
               {{ t("redis.stopFetchAll") }}
             </Button>
           </div>
