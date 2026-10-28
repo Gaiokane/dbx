@@ -3258,11 +3258,7 @@ where
     for chunk in keys.chunks(SCAN_METADATA_PIPELINE_CHUNK) {
         let chunk_metadata = read_type_and_ttl_chunk(con, chunk).await?;
         for (key, (key_type, ttl)) in chunk.iter().zip(chunk_metadata) {
-            result.push(RedisKeyMetadata {
-                key_raw: redis_key_bytes_to_raw(key),
-                key_type,
-                ttl,
-            });
+            result.push(RedisKeyMetadata { key_raw: redis_key_bytes_to_raw(key), key_type, ttl });
         }
     }
     Ok(result)
@@ -9472,7 +9468,8 @@ mod tests {
 
         // The metadata never travels in one oversized round trip: every packed
         // command carries at most one chunk worth of TYPE and TTL commands.
-        let type_pipelines: Vec<&String> = con.commands.iter().filter(|packed| packed.contains("\r\nTYPE\r\n")).collect();
+        let type_pipelines: Vec<&String> =
+            con.commands.iter().filter(|packed| packed.contains("\r\nTYPE\r\n")).collect();
         assert_eq!(type_pipelines.len(), 2);
         assert_eq!(command_offsets(type_pipelines[0], "TYPE").len(), chunk);
         assert_eq!(command_offsets(type_pipelines[0], "TTL").len(), chunk);
@@ -9596,7 +9593,8 @@ mod tests {
 
         // The metadata never travels in one oversized round trip: every packed
         // command carries at most one chunk worth of TYPE and TTL commands.
-        let type_pipelines: Vec<&String> = con.commands.iter().filter(|packed| packed.contains("\r\nTYPE\r\n")).collect();
+        let type_pipelines: Vec<&String> =
+            con.commands.iter().filter(|packed| packed.contains("\r\nTYPE\r\n")).collect();
         assert_eq!(type_pipelines.len(), 2);
         assert_eq!(command_offsets(type_pipelines[0], "TYPE").len(), chunk);
         assert_eq!(command_offsets(type_pipelines[0], "TTL").len(), chunk);
@@ -9621,7 +9619,8 @@ mod tests {
     async fn key_metadata_batch_answers_unknown_expiry_for_a_vanished_key() {
         // "none" is a readable answer: the key does not exist any more, which
         // is not the same as an answer that cannot be parsed.
-        let mut con = FakeRedisConnection::new(vec![RedisRawValue::SimpleString("none".to_string()), RedisRawValue::Int(-2)]);
+        let mut con =
+            FakeRedisConnection::new(vec![RedisRawValue::SimpleString("none".to_string()), RedisRawValue::Int(-2)]);
 
         let result = super::key_metadata_batch(&mut con, &[b"gone".to_vec()]).await.unwrap();
 
