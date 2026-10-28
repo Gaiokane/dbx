@@ -9585,10 +9585,10 @@ mod tests {
         let result = super::key_metadata_batch(&mut con, &keys).await.unwrap();
 
         assert_eq!(result.len(), key_count);
-        for index in 0..key_count {
+        for (index, metadata) in result.iter().enumerate() {
             let expected_type = if index % 2 == 0 { "string" } else { "hash" };
-            assert_eq!(result[index].key_type, expected_type);
-            assert_eq!(result[index].ttl, index as i64);
+            assert_eq!(metadata.key_type, expected_type);
+            assert_eq!(metadata.ttl, index as i64);
         }
 
         // The metadata never travels in one oversized round trip: every packed
