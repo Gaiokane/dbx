@@ -7872,7 +7872,7 @@ export default {
     allKeysLoaded: "All keys loaded",
     loadMoreAllLoadedHint: 'The whole database was scanned, there is nothing more to load. Use "Reload all" to scan it again from the start.',
     refetchAllKeysHint: "Rescan the whole database from the start and replace the current list with the result.",
-    backfillMetadata: "Fill TTL",
+    backfillMetadata: "Fill type & expiry",
     backfillMetadataPending: "Some keys still miss their type and expiry time",
     backfillMetadataProgress: "Filling metadata {loaded} / {total}",
     backfillMetadataHint: "This database was listed without type and expiry information. Fill it for every loaded key.",

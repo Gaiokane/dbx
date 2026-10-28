@@ -6,15 +6,29 @@
  */
 
 /**
+ * Keys one sweep round trip asks Redis for.
+ *
+ * The sweep uses large key-only SCAN pages and rebuilds the tree once at the
+ * end; the per-page tree sorting dominates the runtime on million-key pattern
+ * scans.
+ */
+export const REDIS_FETCH_ALL_SCAN_COUNT = 50_000;
+
+/**
  * Keys a single sweep may pay for inline TYPE/TTL metadata.
  *
- * The sweep asks Redis for COUNT = 50 000 keys per round trip, so one batch
- * already costs at most 2 * 50 000 commands. The budget keeps a whole sweep at
- * that order of magnitude no matter how large the keyspace is: the keys
- * beyond it are listed by name and their badges are filled in afterwards, for
- * the rows the user actually looks at.
+ * The sweep asks Redis for COUNT = REDIS_FETCH_ALL_SCAN_COUNT keys per round
+ * trip, so one batch already costs at most 2 * REDIS_FETCH_ALL_SCAN_COUNT
+ * commands. The budget keeps a whole sweep at that order of magnitude no
+ * matter how large the keyspace is: the keys beyond it are listed by name and
+ * their badges are filled in afterwards, for the rows the user actually looks
+ * at.
+ *
+ * The budget is the page size because the first batch of a sweep is inlined
+ * unconditionally: a smaller budget would only mean the sweep pays for more
+ * than the budget allows.
  */
-export const REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS = 50_000;
+export const REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS = REDIS_FETCH_ALL_SCAN_COUNT;
 
 /**
  * Whether the sweep may keep asking for inline TYPE/TTL metadata.

@@ -66,7 +66,7 @@ import { redisFuzzySearchScanBudget, createRedisKeyPatternMatcher, redisKeySearc
 import { filterRedisKeyTemplates, resolveRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 import { forgetRedisKeySearchHistory, loadRedisKeySearchHistory, rememberRedisKeySearchHistory, type RedisKeySearchHistoryScope } from "@/lib/redis/redisKeySearchHistory";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
-import { redisFetchAllShouldInlineMetadata, trimRedisMetadataBackfillQueue } from "@/lib/redis/redisKeyMetadata";
+import { REDIS_FETCH_ALL_SCAN_COUNT, redisFetchAllShouldInlineMetadata, trimRedisMetadataBackfillQueue } from "@/lib/redis/redisKeyMetadata";
 import { chunkRedisKeyRaws, collectUniqueRedisKeys } from "@/lib/redis/redisKeyBatch";
 import { getRedisCreateKeyTypeHelp, redisCreateKeyTypeHelpOptionOnOpen, shouldActivateRedisCreateKeyTypeHelpOnFocus } from "@/lib/redis/redisCreateKeyTypeHelp";
 import { optionHelpPanelOffsetTop } from "@/lib/common/optionHelpPanelOffset";
@@ -400,8 +400,9 @@ watch(redisKeySeparator, () => {
   rebuildTree();
 });
 const lastTotalKeys = ref(0);
-// “仅看无过期”过滤开关：开启后只保留 TTL 为 -1（永不过期）的已加载 key。
-// TTL 为 -2 的行（fetch-all 链路未查询 TTL）不会出现在过滤结果里。
+// “仅看无过期”过滤开关：开启后只保留 TTL 为 -1（永不过期）的已加载 key，
+// 以及 TTL 仍未知的行：未知的行先留在结果里，等补齐元数据拿到真实 TTL 后
+// 再决定去留，否则整列未知 TTL 的行会在补齐前被全部藏起来。
 const noExpiryOnly = ref(restoredRedisKeyBrowserState?.noExpiryOnly ?? false);
 
 function persistRedisKeyBrowserState() {
@@ -466,7 +467,10 @@ const fetchAllProgressText = computed(() => {
 // · 已经扫完 → 从游标 0 重扫整个库并替换列表，可以反复触发。
 // 过滤/搜索模式同样开放：重扫会带上当前的 pattern / 值查询条件重新扫一遍，
 // key 模式由服务端 MATCH 过滤，值搜索则仍需逐键取值后在客户端过滤。
-const fetchAllActionLabel = computed(() => (hasMore.value ? t("redis.fetchAllKeys") : t("redis.refetchAllKeys")));
+// 文案、提示与点击入口都从这一个判据派生，避免出现“文案说重扫、动作却是续扫”。
+const fetchAllMode = computed<FetchAllMode>(() => (hasMore.value ? "resume" : "rescan"));
+const fetchAllActionLabel = computed(() => (fetchAllMode.value === "resume" ? t("redis.fetchAllKeys") : t("redis.refetchAllKeys")));
+const fetchAllActionHint = computed(() => (fetchAllMode.value === "resume" ? t("redis.fetchAllKeysHint") : t("redis.refetchAllKeysHint")));
 const keyCountText = computed(() => {
   if (loading.value && flatKeys.value.length === 0) return loadingEmptyText.value;
   if (!hasFilteredKeyRange.value && lastTotalKeys.value > 0) {
@@ -773,8 +777,6 @@ const METADATA_BACKFILL_WINDOW = 400;
 /** Keys whose metadata was already resolved, so they are never asked twice. */
 const metadataResolvedRaws = new Set<string>();
 const metadataBackfillQueue = new Set<string>();
-/** Keys whose metadata the server answered for since the last full load. */
-const metadataResolvedCount = ref(0);
 let metadataBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Drops the TTL observation records of keys that are no longer listed. */
@@ -789,7 +791,6 @@ function pruneTtlObservationCache(keep: ReadonlySet<string>) {
 function resetMetadataBackfillState() {
   metadataResolvedRaws.clear();
   metadataBackfillQueue.clear();
-  metadataResolvedCount.value = 0;
   metadataBackfillProgress.value = null;
   if (metadataBackfillTimer) {
     clearTimeout(metadataBackfillTimer);
@@ -831,10 +832,7 @@ function recountMissingMetadata() {
 function metadataBackfillWindow(): RedisKeyTreeRow[] {
   const rows = visibleRows.value;
   if (rows.length === 0) return rows;
-  const scroller = redisKeyScroller() as unknown as {
-    getScroll?: () => { start: number; end: number };
-    findItemIndex?: (offset: number) => number;
-  } | null;
+  const scroller = redisKeyScroller();
   if (typeof scroller?.getScroll !== "function" || typeof scroller.findItemIndex !== "function") {
     return rows.slice(0, METADATA_BACKFILL_WINDOW);
   }
@@ -845,18 +843,34 @@ function metadataBackfillWindow(): RedisKeyTreeRow[] {
   return rows.slice(first, last + 1);
 }
 
-/** Collects the visible rows whose metadata is still missing. */
+/**
+ * Collects the loaded keys whose metadata is still missing.
+ *
+ * The visible window is the cheapest source, but it is empty while a custom
+ * grouping renders the list: the grouped rows are not the loaded keys, so the
+ * head of the loaded list is used instead. Without that fallback the badges of
+ * a grouped list would never be filled.
+ */
 function metadataBackfillCandidates(limit: number): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
-  for (const row of metadataBackfillWindow()) {
-    if (row.node.kind !== "leaf") continue;
-    const keyRaw = row.node.keyRaw;
+  const rows = metadataBackfillWindow();
+  const infos: (RedisKeyInfo | undefined)[] = [];
+  if (rows.length > 0) {
+    for (const row of rows) {
+      if (row.node.kind !== "leaf") continue;
+      infos.push(flatKeyByRaw.get(row.node.keyRaw));
+    }
+  } else {
+    infos.push(...flatKeys.value.slice(0, METADATA_BACKFILL_WINDOW));
+  }
+  for (const info of infos) {
+    if (!info) continue;
+    const keyRaw = info.key_raw;
     if (seen.has(keyRaw)) continue;
     seen.add(keyRaw);
     if (metadataResolvedRaws.has(keyRaw)) continue;
-    const info = flatKeyByRaw.get(keyRaw);
-    if (!info || !redisKeyNeedsMetadata(info)) continue;
+    if (!redisKeyNeedsMetadata(info)) continue;
     candidates.push(keyRaw);
     if (candidates.length >= limit) break;
   }
@@ -914,10 +928,7 @@ function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
     // must stop counting as a key whose metadata is missing.
     const wasMissing = redisKeyNeedsMetadata(existing) && !metadataResolvedRaws.has(entry.key_raw);
     metadataResolvedRaws.add(entry.key_raw);
-    if (wasMissing) {
-      metadataResolvedCount.value++;
-      missingMetadataCount.value = Math.max(0, missingMetadataCount.value - 1);
-    }
+    if (wasMissing) missingMetadataCount.value = Math.max(0, missingMetadataCount.value - 1);
     const previousTtl = existing.ttl ?? -2;
     const nextType = entry.key_type || existing.key_type;
     const nextTtl = entry.ttl;
@@ -949,56 +960,62 @@ function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
   syncListTtlTimer();
 }
 
+/**
+ * Resolves the metadata of the given keys, one batch at a time.
+ *
+ * The automatic backfill and the "fill all" button ask the backend for the
+ * same thing, so they share this loop: only the candidate set, the progress
+ * reporting and the way a failure is reported differ.
+ */
+async function runMetadataBackfill(candidates: readonly string[], options: { reportProgress?: boolean; onFailure?: (error: unknown) => void } = {}): Promise<void> {
+  if (metadataBackfillRunning.value) return;
+  if (candidates.length === 0) return;
+  metadataBackfillRunning.value = true;
+  const requestId = searchRequestId;
+  if (options.reportProgress) metadataBackfillProgress.value = { loaded: 0, total: candidates.length };
+  try {
+    for (let offset = 0; offset < candidates.length; offset += METADATA_BACKFILL_BATCH_SIZE) {
+      if (!redisBrowserIsActive) return;
+      // A later load replaced the list: the remaining batches belong to rows
+      // that no longer exist and must not be asked for.
+      if (requestId !== searchRequestId) return;
+      const batch = candidates.slice(offset, offset + METADATA_BACKFILL_BATCH_SIZE);
+      const metadata = await api.redisKeyMetadataBatch(props.connectionId, props.db, batch);
+      if (requestId !== searchRequestId) return;
+      applyMetadataBatch(metadata);
+      if (options.reportProgress) metadataBackfillProgress.value = { loaded: offset + batch.length, total: candidates.length };
+    }
+  } catch (error) {
+    if (options.onFailure) options.onFailure(error);
+    else console.warn("[DBX] Redis key metadata backfill failed", error);
+  } finally {
+    metadataBackfillRunning.value = false;
+    if (options.reportProgress) metadataBackfillProgress.value = null;
+  }
+}
+
+/**
+ * Flushes the queued keys.
+ *
+ * A failed batch is not queued again: the automatic backfill would retry it
+ * forever without any progress. The next trigger asks for the visible rows
+ * again, which puts the same keys back into the queue.
+ */
 async function flushMetadataBackfill() {
   if (metadataBackfillRunning.value) return;
   const batch = [...metadataBackfillQueue].slice(0, METADATA_BACKFILL_BATCH_SIZE);
   if (batch.length === 0) return;
   for (const keyRaw of batch) metadataBackfillQueue.delete(keyRaw);
-  metadataBackfillRunning.value = true;
-  const requestId = searchRequestId;
-  try {
-    const metadata = await api.redisKeyMetadataBatch(props.connectionId, props.db, batch);
-    // A later load replaced the list in the meantime: the response belongs to
-    // rows that no longer exist and must not be written back.
-    if (requestId !== searchRequestId) return;
-    applyMetadataBatch(metadata);
-    metadataBackfillProgress.value = { loaded: metadataResolvedCount.value, total: metadataResolvedCount.value + missingMetadataCount.value };
-  } catch (error) {
-    // A failed batch keeps the rows unresolved instead of retrying forever;
-    // the next trigger asks again.
-    console.warn("[DBX] Redis key metadata backfill failed", error);
-  } finally {
-    metadataBackfillRunning.value = false;
-    if (metadataBackfillQueue.size > 0) scheduleMetadataBackfill();
-  }
+  await runMetadataBackfill(batch);
+  if (metadataBackfillQueue.size > 0) scheduleMetadataBackfill();
 }
 
 /** Resolves the metadata of every loaded row, not only the visible ones. */
 async function backfillAllKeyMetadata() {
   if (metadataBackfillRunning.value) return;
-  const pending = flatKeys.value.filter((key) => redisKeyNeedsMetadata(key) && !metadataResolvedRaws.has(key.key_raw));
+  const pending = flatKeys.value.filter((key) => redisKeyNeedsMetadata(key) && !metadataResolvedRaws.has(key.key_raw)).map((key) => key.key_raw);
   if (pending.length === 0) return;
-  metadataBackfillRunning.value = true;
-  metadataBackfillProgress.value = { loaded: 0, total: pending.length };
-  const requestId = searchRequestId;
-  try {
-    for (let offset = 0; offset < pending.length; offset += METADATA_BACKFILL_BATCH_SIZE) {
-      if (!redisBrowserIsActive) return;
-      // A later load replaced the list: the remaining batches belong to rows
-      // that no longer exist and must not be asked for.
-      if (requestId !== searchRequestId) return;
-      const batch = pending.slice(offset, offset + METADATA_BACKFILL_BATCH_SIZE).map((key) => key.key_raw);
-      const metadata = await api.redisKeyMetadataBatch(props.connectionId, props.db, batch);
-      if (requestId !== searchRequestId) return;
-      applyMetadataBatch(metadata);
-      metadataBackfillProgress.value = { loaded: Math.min(offset + batch.length, pending.length), total: pending.length };
-    }
-  } catch (error) {
-    toast(errorMessage(error), 5000);
-  } finally {
-    metadataBackfillRunning.value = false;
-    metadataBackfillProgress.value = null;
-  }
+  await runMetadataBackfill(pending, { reportProgress: true, onFailure: (error) => toast(errorMessage(error), 5000) });
 }
 
 /** True when at least one loaded row still misses its type badge or TTL. */
@@ -1390,16 +1407,34 @@ async function fetchScanPage(requestId = searchRequestId, operationId?: number, 
   return { cursor, keys: [], total_keys: totalKeys };
 }
 
+/**
+ * One page of a batch scan.
+ *
+ * `result` is what the list shows: the server's answer narrowed to the
+ * connection scope. `metadataKeyCount` is what the server was asked about:
+ * the inline TYPE/TTL metadata is paid for every key it answered, including
+ * the ones the scope filter drops afterwards. Counting the filtered rows
+ * instead would let the metadata cost grow with the keyspace while the
+ * budget still reads as "not reached yet".
+ */
+interface ScanBatchPage {
+  result: RedisScanResult;
+  metadataKeyCount: number;
+}
+
 /// Batch-scan variant that performs multiple SCAN iterations server-side.
 /// Dramatically reduces frontend↔backend roundtrips for bulk loading.
-async function fetchScanBatchPage(maxIterations: number, options: { count?: number; includeTypes?: boolean } = {}): Promise<RedisScanResult> {
+async function fetchScanBatchPage(maxIterations: number, options: { count?: number; includeTypes?: boolean } = {}): Promise<ScanBatchPage> {
   // Value search cannot be batched because each key requires a GET.
   // Keep its configured COUNT independent of the key-only bulk override.
   if (isValueSearchMode.value && valueQuery.value) {
-    return filterScanResultToScope(await api.redisScanValues(props.connectionId, props.db, scanCursor.value, defaultScopePattern.value, valueQuery.value, redisScanPageSize.value, searchMode.value === "all"));
+    const scanned = await api.redisScanValues(props.connectionId, props.db, scanCursor.value, defaultScopePattern.value, valueQuery.value, redisScanPageSize.value, searchMode.value === "all");
+    // The value scan never asks for inline metadata.
+    return { result: filterScanResultToScope(scanned), metadataKeyCount: 0 };
   }
   const pageSize = options.count ?? redisScanPageSize.value;
-  return filterScanResultToScope(await api.redisScanKeysBatch(props.connectionId, props.db, scanCursor.value, scanKeyPattern.value, pageSize, maxIterations, options.includeTypes ?? false));
+  const scanned = await api.redisScanKeysBatch(props.connectionId, props.db, scanCursor.value, scanKeyPattern.value, pageSize, maxIterations, options.includeTypes ?? false);
+  return { result: filterScanResultToScope(scanned), metadataKeyCount: scanned.keys.length };
 }
 
 function appendScanResult(result: RedisScanResult, options: { updateTree?: boolean; buffer?: RedisKeyInfo[] } = {}): number {
@@ -1636,9 +1671,9 @@ function onRedisKeyScroll(event: Event) {
   });
 }
 
-// Fetch-all uses large key-only SCAN pages and rebuilds the tree once at the
-// end; per-page tree sorting dominates runtime on million-key pattern scans.
-const FETCH_ALL_SCAN_COUNT = 50000;
+// Fetch-all rebuilds the tree once at the end; per-page tree sorting
+// dominates runtime on million-key pattern scans. The page size lives next to
+// the metadata budget, because the budget is derived from it.
 const FETCH_ALL_BATCH_ITERATIONS = 8;
 const FETCH_ALL_PUBLISH_CHUNK_SIZE = 25_000;
 
@@ -1831,18 +1866,20 @@ async function fetchAll(mode: FetchAllMode = "resume"): Promise<boolean> {
   let includeTypes = true;
   try {
     while (requestId === searchRequestId && !fetchAllStopRequested.value && hasMore.value) {
-      const result = await fetchScanBatchPage(FETCH_ALL_BATCH_ITERATIONS, {
-        count: FETCH_ALL_SCAN_COUNT,
+      const page = await fetchScanBatchPage(FETCH_ALL_BATCH_ITERATIONS, {
+        count: REDIS_FETCH_ALL_SCAN_COUNT,
         includeTypes,
       });
       if (requestId !== searchRequestId) break;
-      changed = bufferFetchAllScanResult(result, bufferedKeys, bufferedKeyRaws, rescan ? 0 : flatKeys.value.length) > 0 || changed;
+      changed = bufferFetchAllScanResult(page.result, bufferedKeys, bufferedKeyRaws, rescan ? 0 : flatKeys.value.length) > 0 || changed;
       fetchAllLoadedCount.value = (rescan ? 0 : flatKeys.value.length) + bufferedKeys.length;
       if (includeTypes) {
         // The budget counts the keys the sweep already asked the server
         // about, so it holds for every mode: a continuation, a rescan and a
-        // filtered sweep all count the keys they actually matched.
-        inlineMetadataKeys += result.keys.length;
+        // filtered sweep all count the keys they actually matched. The scope
+        // filter is applied after the answer arrived, so the keys it drops
+        // were paid for as well and have to be part of the count.
+        inlineMetadataKeys += page.metadataKeyCount;
         if (!redisFetchAllShouldInlineMetadata(inlineMetadataKeys)) includeTypes = false;
       }
     }
@@ -1938,8 +1975,7 @@ function stopFetchAll() {
  * a value search still has to fetch and match every value on the client.
  */
 function startFetchAll() {
-  const mode: FetchAllMode = hasMore.value ? "resume" : "rescan";
-  void fetchAll(mode).catch((error) => toast(errorMessage(error), 5000));
+  void fetchAll(fetchAllMode.value).catch((error) => toast(errorMessage(error), 5000));
 }
 
 // 展开分组时的定向补扫：树模式的自动加载只覆盖有界 SCAN 预算内的键，
@@ -4212,7 +4248,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
               <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
               {{ hasMore ? t("redis.loadMoreKeys") : t("redis.allKeysLoaded") }}
             </Button>
-            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loading || searchPending || mutatingKeys" :title="hasMore ? t('redis.fetchAllKeysHint') : t('redis.refetchAllKeysHint')" data-redis-fetch-all @click="startFetchAll">
+            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loading || searchPending || mutatingKeys" :title="fetchAllActionHint" data-redis-fetch-all @click="startFetchAll">
               {{ fetchAllActionLabel }}
             </Button>
           </div>

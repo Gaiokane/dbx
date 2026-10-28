@@ -655,6 +655,17 @@ function keyInfo(rawKey: string): RedisKeyInfo {
   return { key_display: rawKey, key_raw: rawKey, key_type: "string", ttl: -1, size: 0, value_preview: "" };
 }
 
+/**
+ * A key the server listed without metadata.
+ *
+ * The payload leaves the type and the TTL out entirely instead of sending a
+ * sentinel, so the frontend sees `undefined` for both. The fixtures have to
+ * use that shape: a -2 sentinel is not what the server sends.
+ */
+function keyInfoWithoutMetadata(name: string): RedisKeyInfo {
+  return { key_display: name, key_raw: btoa(name) };
+}
+
 async function searchByValue(host: HTMLElement, mode: "value" | "all" = "value") {
   const modeIndex = mode === "value" ? 1 : 2;
   host.querySelectorAll<HTMLButtonElement>(".redis-search-mode-button")[modeIndex]?.click();
@@ -1336,7 +1347,7 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
 
   it("drops a row from the no-expiry filter once the server resolves its expiry", async () => {
     mocks.infiniteScroll = false;
-    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    const withoutMetadata = keyInfoWithoutMetadata("a");
     mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
 
     const host = mountBrowser();
@@ -1362,9 +1373,40 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(host.querySelector(leaf)).toBeNull();
   });
 
+  it("keeps a row with an unresolved expiry in the no-expiry filter", async () => {
+    mocks.infiniteScroll = false;
+    // The server listed the key without metadata: the payload omits the type
+    // and the TTL instead of sending a sentinel.
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [keyInfoWithoutMetadata("a")], total_keys: 1 });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const leaf = `[data-redis-leaf="${btoa("a")}"]`;
+    host.querySelector<HTMLButtonElement>("[data-redis-no-expiry-filter]")!.click();
+    await settleThoroughly();
+    // An unknown expiry is not "it expires": the row stays in the filter
+    // until the server answers for it.
+    expect(host.querySelector(leaf)).not.toBeNull();
+
+    // The row is reachable for the backfill, so the backend is asked for it.
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "string", ttl: -1 }]);
+    host.querySelector<HTMLButtonElement>("[data-redis-backfill-metadata]")!.click();
+    await settleThoroughly();
+
+    const metadataCalls = mocks.redisKeyMetadataBatch.mock.calls;
+    expect(metadataCalls[metadataCalls.length - 1]?.[2]).toEqual([btoa("a")]);
+    // The key never expires, so it stays in the filter and shows its badge.
+    expect(host.querySelector(leaf)).not.toBeNull();
+    expect(host.querySelector(`[data-redis-key-raw="${btoa("a")}"]`)!.textContent).toContain("string");
+  });
+
   it("removes a key that the server reports as gone during the backfill", async () => {
     mocks.infiniteScroll = false;
-    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    const withoutMetadata = keyInfoWithoutMetadata("a");
     mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
 
     const host = mountBrowser();
@@ -1387,7 +1429,7 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
 
   it("still refreshes the other rows when a batch also reports a gone key", async () => {
     mocks.infiniteScroll = false;
-    const withoutMetadata = (name: string) => ({ key_display: name, key_raw: btoa(name), key_type: "", ttl: -2, size: 0, value_preview: "" });
+    const withoutMetadata = keyInfoWithoutMetadata;
     mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata("a"), withoutMetadata("b")], total_keys: 2 });
 
     const host = mountBrowser();
@@ -1420,7 +1462,7 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
 
   it("removes the gone key from the Fetch All snapshot and refreshes the other rows", async () => {
     mocks.infiniteScroll = false;
-    const withoutMetadata = (name: string) => ({ key_display: name, key_raw: btoa(name), key_type: "", ttl: -2, size: 0, value_preview: "" });
+    const withoutMetadata = keyInfoWithoutMetadata;
     mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
       if (cursor === 0) return Promise.resolve({ cursor: 0, keys: [withoutMetadata("a"), withoutMetadata("b")], total_keys: 2 });
       return Promise.resolve({ cursor: 0, keys: [], total_keys: 0 });
@@ -1477,7 +1519,7 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
 
   it("fills the missing type and expiry metadata of the listed rows", async () => {
     mocks.infiniteScroll = false;
-    const withoutMetadata = { key_display: "a", key_raw: btoa("a"), key_type: "", ttl: -2, size: 0, value_preview: "" };
+    const withoutMetadata = keyInfoWithoutMetadata("a");
     mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 1 });
     mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "string", ttl: 3600 }]);
 

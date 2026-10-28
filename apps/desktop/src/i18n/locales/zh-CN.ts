@@ -7845,7 +7845,7 @@ export default withEnglishFallback({
     allKeysLoaded: "已全部加载",
     loadMoreAllLoadedHint: "整个库已扫完，没有更多可加载。点“重新加载全部”可以从头再扫一遍。",
     refetchAllKeysHint: "从头重新扫描整个库，并用新结果替换当前列表。",
-    backfillMetadata: "补齐 TTL",
+    backfillMetadata: "补齐类型与过期",
     backfillMetadataPending: "部分 key 还缺少类型和过期时间",
     backfillMetadataProgress: "正在补齐 {loaded} / {total}",
     backfillMetadataHint: "这个库是按键名加载的，没有取类型和过期时间，可为全部已加载的 key 补齐。",

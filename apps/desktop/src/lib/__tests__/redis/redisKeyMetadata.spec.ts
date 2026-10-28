@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS, REDIS_METADATA_BACKFILL_QUEUE_LIMIT, redisFetchAllShouldInlineMetadata, trimRedisMetadataBackfillQueue } from "@/lib/redis/redisKeyMetadata";
+import { REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS, REDIS_FETCH_ALL_SCAN_COUNT, REDIS_METADATA_BACKFILL_QUEUE_LIMIT, redisFetchAllShouldInlineMetadata, trimRedisMetadataBackfillQueue } from "@/lib/redis/redisKeyMetadata";
 
 describe("Redis key metadata budget", () => {
   it("keeps the metadata inline while the sweep stays inside the budget", () => {
@@ -13,9 +13,11 @@ describe("Redis key metadata budget", () => {
   });
 
   it("matches the scan batch size so one batch cannot blow the budget up", () => {
-    // The sweep asks Redis for COUNT = 50 000 keys per round trip, so a
-    // single batch is the largest unit the budget has to absorb.
-    expect(REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS).toBe(50_000);
+    // The sweep asks Redis for COUNT = REDIS_FETCH_ALL_SCAN_COUNT keys per
+    // round trip, so a single batch is the largest unit the budget has to
+    // absorb: the first batch of a sweep is inlined unconditionally.
+    expect(REDIS_FETCH_ALL_INLINE_METADATA_MAX_KEYS).toBe(REDIS_FETCH_ALL_SCAN_COUNT);
+    expect(REDIS_FETCH_ALL_SCAN_COUNT).toBe(50_000);
   });
 });
 

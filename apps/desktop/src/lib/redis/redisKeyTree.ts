@@ -11,14 +11,20 @@ export function canBuildRedisFuzzyTree(loadedKeyCount: number): boolean {
 /**
  * Membership of the "no expiry" filter.
  *
- * A TTL of -2 means the expiry is *unknown*, not "it expires": rows loaded
- * without inline metadata (the "fetch all" sweep skips TYPE/TTL for large
- * keyspaces) must stay in the projection until a metadata backfill resolves
- * them. Dropping them here would silently hide every unresolved key instead
- * of showing it as "not yet known".
+ * An unknown expiry means the expiry is *unknown*, not "it expires": rows
+ * loaded without inline metadata (the "fetch all" sweep skips TYPE/TTL for
+ * large keyspaces) must stay in the projection until a metadata backfill
+ * resolves them. Dropping them here would silently hide every unresolved key
+ * instead of showing it as "not yet known".
+ *
+ * The unknown TTL arrives in two shapes and both mean the same thing: the
+ * payload leaves the field out entirely (`undefined`) and the Rust side uses
+ * -2 as its "no answer" sentinel. They are normalised here so the predicate
+ * and the metadata backfill agree on what "unresolved" looks like.
  */
 export function redisKeyPassesNoExpiryFilter(key: Pick<RedisKeyInfo, "ttl">): boolean {
-  return key.ttl === -1 || key.ttl === -2;
+  const ttl = key.ttl ?? -2;
+  return ttl === -1 || ttl === -2;
 }
 
 export interface RedisKeyTreeLeafNode {
