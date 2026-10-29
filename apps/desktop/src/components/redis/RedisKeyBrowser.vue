@@ -776,6 +776,8 @@ const METADATA_BACKFILL_WINDOW = 400;
 
 /** Keys whose metadata was already resolved, so they are never asked twice. */
 const metadataResolvedRaws = new Set<string>();
+/** Keys the server reported as gone: they are not asked again while they stay absent. */
+const metadataGoneKeyRaws = new Set<string>();
 const metadataBackfillQueue = new Set<string>();
 let metadataBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -790,6 +792,7 @@ function pruneTtlObservationCache(keep: ReadonlySet<string>) {
 
 function resetMetadataBackfillState() {
   metadataResolvedRaws.clear();
+  metadataGoneKeyRaws.clear();
   metadataBackfillQueue.clear();
   metadataBackfillProgress.value = null;
   if (metadataBackfillTimer) {
@@ -870,6 +873,9 @@ function metadataBackfillCandidates(limit: number): string[] {
     if (seen.has(keyRaw)) continue;
     seen.add(keyRaw);
     if (metadataResolvedRaws.has(keyRaw)) continue;
+    // The server already said that this key does not exist. Asking again only
+    // spends a round trip on an answer that cannot change the row.
+    if (metadataGoneKeyRaws.has(keyRaw)) continue;
     if (!redisKeyNeedsMetadata(info)) continue;
     candidates.push(keyRaw);
     if (candidates.length >= limit) break;
@@ -924,7 +930,11 @@ function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
     // the list instead of staying behind as a row whose expiry is unknown.
     if (entry.key_type === "none") {
       vanishedKeyRaws.add(entry.key_raw);
-      metadataResolvedRaws.add(entry.key_raw);
+      // The key is gone, not resolved: the row leaves the list and the key is
+      // only remembered as "the server says it does not exist". A key that
+      // comes back has to be asked again, so it is not recorded as resolved.
+      metadataResolvedRaws.delete(entry.key_raw);
+      metadataGoneKeyRaws.add(entry.key_raw);
       continue;
     }
     // A key the server answered for is resolved, even when the answer is
@@ -1033,7 +1043,15 @@ const hasMissingKeyMetadata = computed(() => missingMetadataCount.value > 0);
 
 function appendFlatKeyRecords(keys: readonly RedisKeyInfo[]) {
   if (keys.length === 0) return;
-  for (const key of keys) flatKeyByRaw.set(key.key_raw, key);
+  for (const key of keys) {
+    flatKeyByRaw.set(key.key_raw, key);
+    // A key that is listed again can be a different key now, so the answers
+    // from the previous listing must not decide whether it still needs
+    // metadata. The row carries its own answer, and a row without one asks
+    // the backfill again.
+    metadataResolvedRaws.delete(key.key_raw);
+    metadataGoneKeyRaws.delete(key.key_raw);
+  }
   flatKeys.value = [...flatKeys.value, ...keys];
   missingMetadataCount.value += countMissingMetadata(keys);
 }
@@ -2225,7 +2243,10 @@ function removeKnownKeys(keyRaws: ReadonlySet<string>) {
     loadedKeyRaws.delete(keyRaw);
     ttlObservedAtByRaw.delete(keyRaw);
     positiveTtlKeyRaws.delete(keyRaw);
-    metadataResolvedRaws.add(keyRaw);
+    // The key does not exist any more. It is not a resolved key: a key that
+    // comes back has to be asked again.
+    metadataResolvedRaws.delete(keyRaw);
+    metadataGoneKeyRaws.add(keyRaw);
     if (selectedKeyRaw.value === keyRaw) selectedKeyRaw.value = null;
   }
   replaceFlatKeyRecords(flatKeys.value.filter((key) => !present.has(key.key_raw)));

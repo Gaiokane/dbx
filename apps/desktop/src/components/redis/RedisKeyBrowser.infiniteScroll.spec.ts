@@ -1499,6 +1499,37 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(host.textContent).toContain("redis.stopFetchAll");
   });
 
+  it("asks a key that came back for its metadata again", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = keyInfoWithoutMetadata("a");
+    mocks.redisScanKeysBatch.mockResolvedValueOnce({ cursor: 42, keys: [withoutMetadata], total_keys: 100 }).mockResolvedValueOnce({ cursor: 0, keys: [withoutMetadata], total_keys: 100 });
+    // The server reports the key as gone, so it leaves the list. The next page
+    // lists it again, because the key was created again in the meantime.
+    mocks.redisKeyMetadataBatch.mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "none", ttl: -2 }]).mockResolvedValueOnce([{ key_raw: btoa("a"), key_type: "string", ttl: 3600 }]);
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    const leaf = `[data-redis-leaf="${btoa("a")}"]`;
+    expect(host.querySelector(leaf)).toBeNull();
+
+    clickLoadMore(host);
+    await settleThoroughly();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    // The key is back in the list and it is a new key now, so its metadata is
+    // asked again instead of being taken from the answer of the old key.
+    expect(host.querySelector(leaf)).not.toBeNull();
+    const metadataCalls = mocks.redisKeyMetadataBatch.mock.calls;
+    expect(metadataCalls[metadataCalls.length - 1]?.[2]).toEqual([btoa("a")]);
+    const row = `[data-redis-key-raw="${btoa("a")}"]`;
+    expect(host.querySelector(row)!.textContent).toContain("string");
+  });
+
   it("still refreshes the other rows when a batch also reports a gone key", async () => {
     mocks.infiniteScroll = false;
     const withoutMetadata = keyInfoWithoutMetadata;
