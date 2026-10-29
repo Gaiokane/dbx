@@ -891,6 +891,10 @@ function metadataBackfillCandidates(limit: number): string[] {
  */
 function scheduleMetadataBackfill() {
   if (!redisBrowserIsActive) return;
+  // A sweep owns the visible list until it publishes it. A backfill that
+  // removes a row invalidates the sweep and throws away everything it
+  // collected, so the automatic backfill waits for the sweep to finish.
+  if (isFetchingAll.value) return;
   try {
     for (const keyRaw of metadataBackfillCandidates(METADATA_BACKFILL_WINDOW)) {
       metadataBackfillQueue.add(keyRaw);
@@ -947,7 +951,10 @@ function applyMetadataBatch(metadata: readonly RedisKeyMetadata[]): void {
     recordKeyTtlObservedAt(next);
     changed = true;
   }
-  if (vanishedKeyRaws.size > 0) {
+  // A sweep owns the list until it publishes it, so a row that vanished under
+  // it stays until the sweep is over. Removing it now would abort the sweep
+  // and throw away everything it collected; the backfill removes it later.
+  if (vanishedKeyRaws.size > 0 && !isFetchingAll.value) {
     // The rows are gone, so the list and the tree are rebuilt for them.
     removeKnownKeys(vanishedKeyRaws);
   }
@@ -1003,6 +1010,9 @@ async function runMetadataBackfill(candidates: readonly string[], options: { rep
  */
 async function flushMetadataBackfill() {
   if (metadataBackfillRunning.value) return;
+  // The sweep owns the visible list, so the queued keys wait for it. The queue
+  // is kept, so the rows are still filled in once the sweep is over.
+  if (isFetchingAll.value) return;
   const batch = [...metadataBackfillQueue].slice(0, METADATA_BACKFILL_BATCH_SIZE);
   if (batch.length === 0) return;
   for (const keyRaw of batch) metadataBackfillQueue.delete(keyRaw);

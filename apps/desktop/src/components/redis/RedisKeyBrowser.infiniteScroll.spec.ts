@@ -1427,6 +1427,78 @@ describe("RedisKeyBrowser footer actions (permanent action bar)", () => {
     expect(host.querySelector(leaf)).toBeNull();
   });
 
+  it("keeps a running sweep alive when a backfill reports a vanished key", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = keyInfoWithoutMetadata("a");
+    const sweep = deferred<{ cursor: number; keys: RedisKeyInfo[]; total_keys: number }>();
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
+      // The first page leaves the keyspace open and the sweep keeps running on
+      // it, so the sweep owns the list while the backfill answers.
+      if (cursor === 0) return Promise.resolve({ cursor: 42, keys: [withoutMetadata], total_keys: 100 });
+      return sweep.promise;
+    });
+    const answer = deferred<{ key_raw: string; key_type: string; ttl: number }[]>();
+    mocks.redisKeyMetadataBatch.mockReturnValue(answer.promise);
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+    // The backfill is in flight and its answer is still on the way.
+    expect(mocks.redisKeyMetadataBatch).toHaveBeenCalled();
+
+    // The sweep starts while that request is still open.
+    host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.click();
+    await settleThoroughly();
+    expect(host.textContent).toContain("redis.stopFetchAll");
+
+    // The server answers that the key does not exist any more. The row cannot
+    // leave the list now: removing it would abort the sweep.
+    answer.resolve([{ key_raw: btoa("a"), key_type: "none", ttl: -2 }]);
+    await settleThoroughly();
+
+    // The sweep is still running, so it did not lose everything it collected.
+    expect(host.textContent).toContain("redis.stopFetchAll");
+    expect(host.querySelector(`[data-redis-leaf="${btoa("a")}"]`)).not.toBeNull();
+  });
+
+  it("does not ask the backend for metadata while a sweep is running", async () => {
+    mocks.infiniteScroll = false;
+    const withoutMetadata = keyInfoWithoutMetadata("a");
+    const sweep = deferred<{ cursor: number; keys: RedisKeyInfo[]; total_keys: number }>();
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => {
+      if (cursor === 0) return Promise.resolve({ cursor: 42, keys: [withoutMetadata], total_keys: 100 });
+      return sweep.promise;
+    });
+
+    const host = mountBrowser();
+    await settleThoroughly();
+    // The automatic backfill is debounced, so it needs a real timer turn. It
+    // answers nothing, so the row still misses its metadata afterwards.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+    const callsBeforeSweep = mocks.redisKeyMetadataBatch.mock.calls.length;
+    expect(callsBeforeSweep).toBeGreaterThan(0);
+
+    // The sweep takes the list over until it publishes it.
+    host.querySelector<HTMLButtonElement>("[data-redis-fetch-all]")!.click();
+    await settleThoroughly();
+    expect(host.textContent).toContain("redis.stopFetchAll");
+
+    // Scrolling during the sweep must not ask the backend for metadata: the
+    // sweep owns the list and the answer could remove a row from under it.
+    const scroller = host.querySelector<HTMLElement>(".redis-key-scroller")!;
+    scroller.scrollTop = 200;
+    scroller.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settleThoroughly();
+
+    expect(mocks.redisKeyMetadataBatch.mock.calls.length).toBe(callsBeforeSweep);
+    // The sweep is still running.
+    expect(host.textContent).toContain("redis.stopFetchAll");
+  });
+
   it("still refreshes the other rows when a batch also reports a gone key", async () => {
     mocks.infiniteScroll = false;
     const withoutMetadata = keyInfoWithoutMetadata;
