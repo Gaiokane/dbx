@@ -680,7 +680,7 @@ async function searchByValue(host: HTMLElement, mode: "value" | "all" = "value")
 }
 
 function clickLoadMore(host: HTMLElement) {
-  const button = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find((candidate) => candidate.textContent?.includes("redis.loadMoreKeys") && !candidate.disabled);
+  const button = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find((candidate) => candidate.textContent?.includes("redis.fetchMoreKeys") && !candidate.disabled);
   expect(button, "load more button").toBeDefined();
   button!.click();
 }
@@ -711,14 +711,14 @@ describe("RedisKeyBrowser bounded value search (issue #7779)", () => {
 
       expect(mocks.redisScanValues).toHaveBeenCalledTimes(1);
       expect(mocks.redisScanValues).toHaveBeenLastCalledWith("connection", 0, 0, "*", "needle", pageSize, searchBoth);
-      expect(host.textContent).toContain("redis.loadMoreKeys");
+      expect(host.textContent).toContain("redis.fetchMoreKeys");
 
       clickLoadMore(host);
       await settleThoroughly(10);
 
       expect(mocks.redisScanValues).toHaveBeenCalledTimes(2);
       expect(mocks.redisScanValues).toHaveBeenLastCalledWith("connection", 0, 41, "*", "needle", pageSize, searchBoth);
-      expect(host.textContent).toContain("redis.loadMoreKeys");
+      expect(host.textContent).toContain("redis.fetchMoreKeys");
     });
 
     it.each(REDIS_SCAN_PAGE_SIZE_OPTIONS)("uses configured COUNT %i throughout explicit Fetch all", async (pageSize) => {

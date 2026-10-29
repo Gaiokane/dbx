@@ -1992,7 +1992,7 @@ const SUBTREE_FILL_MAX_NEW_KEYS = 500;
 const SUBTREE_FILL_MAX_SCAN_ITERATIONS = 50;
 
 function groupRefreshLabel(groupId: string): string {
-  return groupRefresh.value?.groupId === groupId ? t("redis.loadMoreKeys") : t("common.refresh");
+  return groupRefresh.value?.groupId === groupId ? t("redis.fetchMoreKeys") : t("common.refresh");
 }
 
 async function refreshGroupSubtree(group: RedisKeyTreeGroupNode) {
@@ -4121,7 +4121,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
               <span class="mb-3">{{ t("redis.noKeysInScanHint") }}</span>
               <Button variant="outline" size="sm" class="h-7 text-xs" :disabled="loadingMore || searchPending || mutatingKeys" @click="loadMore()">
                 <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
-                {{ t("redis.loadMoreKeys") }}
+                {{ t("redis.fetchMoreKeys") }}
               </Button>
             </template>
             <template v-else>
@@ -4244,9 +4244,9 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
               可以反复触发。
           -->
           <div v-if="!isFetchingAll && (flatKeys.length > 0 || hasMore)" class="shrink-0 border-t px-2 py-1.5 flex items-center gap-1.5">
-            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loadingMore || loading || searchPending || mutatingKeys || !hasMore" :title="hasMore ? t('redis.loadMoreKeysHint') : t('redis.loadMoreAllLoadedHint')" data-redis-load-more @click="loadMore()">
+            <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loadingMore || loading || searchPending || mutatingKeys || !hasMore" :title="hasMore ? t('redis.fetchMoreKeysHint') : t('redis.fetchMoreAllLoadedHint')" data-redis-load-more @click="loadMore()">
               <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
-              {{ hasMore ? t("redis.loadMoreKeys") : t("redis.allKeysLoaded") }}
+              {{ hasMore ? t("redis.fetchMoreKeys") : t("redis.allKeysFetched") }}
             </Button>
             <Button variant="outline" size="sm" class="h-7 text-xs flex-1" :disabled="loading || searchPending || mutatingKeys" :title="fetchAllActionHint" data-redis-fetch-all @click="startFetchAll">
               {{ fetchAllActionLabel }}
